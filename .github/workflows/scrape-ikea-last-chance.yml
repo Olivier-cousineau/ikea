@@ -31,4 +31,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ikea-last-chance
-          path: ikea_last_chance.json
+          path: |
+            ikea_last_chance.json
+            debug_ikea_last_chance.html
+            debug_ikea_last_chance.png
