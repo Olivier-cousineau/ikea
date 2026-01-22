@@ -172,52 +172,19 @@ def list_visible_product_urls(page, container) -> List[str]:
 
 
 def count_product_cards(page) -> int:
-    selectors = [
-        "[data-testid*='product']",
-        "div[class*='plp-product']",
-        "a[href*='/p/']",
-    ]
-    try:
-        return page.evaluate(
-            """
-            (selectors) => {
-                const isVisible = (el) => {
-                    const rect = el.getBoundingClientRect();
-                    const style = window.getComputedStyle(el);
-                    return (
-                        rect.width > 0 &&
-                        rect.height > 0 &&
-                        style &&
-                        style.display !== "none" &&
-                        style.visibility !== "hidden"
-                    );
-                };
-                const counts = selectors.map((selector) => {
-                    const elements = Array.from(document.querySelectorAll(selector));
-                    return elements.filter(isVisible).length;
-                });
-                return Math.max(...counts, 0);
-            }
-            """,
-            selectors,
-        )
-    except Exception:
-        return 0
+    return page.locator("div.plp-product-list_products > *").count()
 
 
 def get_show_more_button(page):
     candidates = [
-        page.locator("button:has-text('Montrer plus')").first,
-        page.locator("button:has-text('Afficher plus')").first,
-        page.get_by_role("button", name="Montrer plus").first,
-        page.get_by_role("button", name="Show more").first,
+        page.locator(
+            "div.plp-catalog-bottom-container button:has-text('Montrer plus')"
+        ).first,
         page.locator("[role='button']:has-text('Montrer plus')").first,
-        page.locator("button:has-text('Show more')").first,
-        page.locator("[role='button']:has-text('Show more')").first,
     ]
     for candidate in candidates:
         try:
-            if candidate.count() > 0:
+            if candidate.count() > 0 and candidate.is_visible(timeout=1500):
                 return candidate
         except Exception:
             continue
@@ -242,6 +209,7 @@ def click_show_more_if_possible(page) -> Dict[str, Optional[str]]:
         return {"clicked": False, "text": btn_text, "found": True}
 
     try:
+        button.scroll_into_view_if_needed()
         button.click(timeout=5000)
     except Exception:
         try:
@@ -311,56 +279,24 @@ def load_all_products(page, debug_html: str, debug_screenshot: str) -> bool:
         close_overlays(page)
         click_info = click_show_more_if_possible(page)
         clicked_load_more = click_info["clicked"]
-        btn_text = click_info["text"]
         if click_info["found"]:
             button_seen = True
 
-        if clicked_load_more:
-            try:
-                page.wait_for_function(
-                    """
-                    (beforeCount) => {
-                        const selectors = [
-                            "[data-testid*='product']",
-                            "div[class*='plp-product']",
-                            "a[href*='/p/']",
-                        ];
-                        const isVisible = (el) => {
-                            const rect = el.getBoundingClientRect();
-                            const style = window.getComputedStyle(el);
-                            return (
-                                rect.width > 0 &&
-                                rect.height > 0 &&
-                                style &&
-                                style.display !== "none" &&
-                                style.visibility !== "hidden"
-                            );
-                        };
-                        const counts = selectors.map((selector) => {
-                            const elements = Array.from(
-                                document.querySelectorAll(selector)
-                            );
-                            return elements.filter(isVisible).length;
-                        });
-                        const current = Math.max(...counts, 0);
-                        return current > beforeCount;
-                    }
-                    """,
-                    arg=before,
-                    timeout=15000,
-                )
-            except Exception:
-                pass
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except PlaywrightTimeoutError:
+            pass
+        except Exception:
+            pass
 
         after = count_product_cards(page)
         print(
             "Scroll/Load #{i}: before={before} after={after} "
-            "clickedLoadMore={clicked} btnText={text}".format(
+            "clickedLoadMore={clicked}".format(
                 i=i,
                 before=before,
                 after=after,
                 clicked=clicked_load_more,
-                text=btn_text or "None",
             )
         )
 
