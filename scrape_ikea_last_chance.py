@@ -67,50 +67,65 @@ def dismiss_consent(page: Any) -> None:
                 continue
 
 
+def find_show_more(page: Any) -> Optional[Any]:
+    selectors = [
+        "a[aria-label*='Afficher plus']",
+        "a.plp-btn.plp-btn--secondary",
+        "a.plp-btn:has-text('Montrer plus')",
+        "a:has-text('Montrer plus')",
+        "a:has-text('Afficher plus de produits')",
+        "a[aria-label*='Show more'], a:has-text('Show more')",
+        "button:has-text('Montrer plus')",
+        "button:has-text('Show more')",
+        "[role=button]:has-text('Montrer plus')",
+        "[role=button]:has-text('Show more')",
+    ]
+    for selector in selectors:
+        locator = page.locator(selector).first
+        if locator.count():
+            return locator
+    return None
+
+
+def count_products(page: Any) -> int:
+    primary_count = page.locator("div.plp-product-list_products > *").count()
+    if primary_count:
+        return primary_count
+    return page.locator("a[href*='/p/']").count()
+
+
 def load_more_until_done(page: Any) -> None:
-    button_selector = (
-        "button:has-text('Montrer plus'), "
-        "button:has-text('Show more'), "
-        "[role=button]:has-text('Montrer plus'), "
-        "[role=button]:has-text('Show more')"
-    )
     max_clicks = 50
     clicks = 0
     last_count = 0
     while clicks < max_clicks:
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(1500)
-        button = page.locator(button_selector).first
-        if not button.count():
+        button = find_show_more(page)
+        if not button:
             break
         try:
             if not button.is_visible():
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 page.wait_for_timeout(1000)
             button.scroll_into_view_if_needed(timeout=2000)
-            current_count = page.locator("a[href*='/p/']").count()
-            button.click(timeout=2000)
-            page.wait_for_timeout(1500)
+            current_count = count_products(page)
             try:
-                page.wait_for_function(
-                    "count => document.querySelectorAll(\"a[href*='/p/']\").length > count",
-                    arg=current_count,
-                    timeout=8000,
-                )
+                button.click(timeout=8000)
+            except Exception:
+                page.evaluate("(el) => el.click()", button)
+            page.wait_for_timeout(800)
+            try:
+                page.wait_for_load_state("networkidle", timeout=10000)
             except Exception:
                 pass
-            updated_count = page.locator("a[href*='/p/']").count()
+            updated_count = count_products(page)
             if updated_count <= last_count and updated_count <= current_count:
                 break
             last_count = updated_count
             clicks += 1
         except Exception:
-            try:
-                page.evaluate("element => element.click()", button)
-                clicks += 1
-                page.wait_for_timeout(1500)
-            except Exception:
-                break
+            break
 
 
 def capture_api_request(page_url: str, headed: bool) -> Tuple[str, Dict[str, str]]:
