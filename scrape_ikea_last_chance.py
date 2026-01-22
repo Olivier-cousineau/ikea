@@ -19,8 +19,13 @@ DEFAULT_URL = (
     "https://www.ikea.com/ca/fr/cat/last-chance/"
     "?filters=f-availability%3AAVAILABLE_IN_STORE"
 )
-DEFAULT_DEBUG_HTML = "debug_ikea_last_chance.html"
-DEFAULT_DEBUG_SCREENSHOT = "debug_ikea_last_chance.png"
+DEFAULT_DEBUG_HTML = "debug_ikea.html"
+DEFAULT_DEBUG_SCREENSHOT = "debug_ikea.png"
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
 
 
 def norm_space(value: Optional[str]) -> str:
@@ -156,32 +161,114 @@ def list_visible_product_urls(page, container) -> List[str]:
     )
 
 
-def load_all_products(page) -> bool:
-    button_selector = (
-        "button:has-text('Montrer plus'), button:has-text('Show more'), "
-        "button:has-text('Voir plus'), button:has-text('Afficher plus')"
+def find_load_more_button(page):
+    primary = page.get_by_role(
+        "button",
+        name=re.compile(
+            r"Montrer plus|Afficher plus|Voir plus|Show more|Load more",
+            re.IGNORECASE,
+        ),
+    ).first
+    if primary.count() > 0:
+        return primary
+
+    fallback_selectors = [
+        "[role='button']:has-text('Montrer plus')",
+        "[role='button']:has-text('Afficher plus')",
+        "[role='button']:has-text('Voir plus')",
+        "[role='button']:has-text('Show more')",
+        "[role='button']:has-text('Load more')",
+    ]
+    fallback = page.locator(", ".join(fallback_selectors)).first
+    if fallback.count() > 0:
+        return fallback
+
+    return (
+        page.locator("text=/Montrer plus|Show more|Load more/i")
+        .locator("xpath=ancestor-or-self::*[self::button or @role='button'][1]")
+        .first
     )
+
+
+def log_visible_plus_texts(page, limit: int = 50) -> None:
+    texts = page.evaluate(
+        """
+        (limit) => {
+            const matcher = /plus/i;
+            const elements = Array.from(document.querySelectorAll("body *"));
+            const output = [];
+            for (const el of elements) {
+                const text = (el.innerText || "").trim();
+                if (!text || !matcher.test(text)) {
+                    continue;
+                }
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                const visible =
+                    rect.width > 0 &&
+                    rect.height > 0 &&
+                    style &&
+                    style.display !== "none" &&
+                    style.visibility !== "hidden";
+                if (!visible) {
+                    continue;
+                }
+                output.push(text);
+            }
+            return output.slice(-limit);
+        }
+        """,
+        limit,
+    )
+    if texts:
+        print("Derniers textes visibles contenant 'plus':")
+        for entry in texts:
+            print(f"- {entry}")
+
+
+def load_all_products(page, debug_html: str, debug_screenshot: str) -> bool:
     stable_rounds = 0
     container = find_products_container(page)
+    main_locator = page.locator("main")
+    main_handle = None
+    if main_locator.count() > 0:
+        try:
+            main_handle = main_locator.first.element_handle()
+        except Exception:
+            main_handle = None
+    button_seen = False
+    debug_dumped = False
 
     def count_products() -> int:
+        if main_handle is not None:
+            return len(list_visible_product_urls(page, main_locator.first))
         return len(list_visible_product_urls(page, container))
 
     for i in range(1, 301):
         before = count_products()
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(1000)
+        page.wait_for_timeout(1200)
 
         clicked_load_more = False
-        button = page.locator(button_selector).first
+        button = find_load_more_button(page)
+        btn_text = None
         try:
-            if button.count() > 0 and button.is_visible(timeout=1500) and button.is_enabled():
+            if button.count() > 0:
+                button_seen = True
+                btn_text = norm_space(button.inner_text(timeout=1500))
+            if (
+                button.count() > 0
+                and button.is_visible(timeout=1500)
+                and button.is_enabled()
+            ):
                 button.click(timeout=5000)
                 clicked_load_more = True
-                page.wait_for_timeout(1000)
+                page.wait_for_timeout(1200)
                 try:
                     root_handle = None
-                    if container is not None:
+                    if main_handle is not None:
+                        root_handle = main_handle
+                    elif container is not None:
                         try:
                             root_handle = container.element_handle()
                         except Exception:
@@ -231,10 +318,22 @@ def load_all_products(page) -> bool:
 
         after = count_products()
         print(
-            "Scroll #{i}: before={before} after={after} clickedLoadMore={clicked}".format(
-                i=i, before=before, after=after, clicked=clicked_load_more
+            "Scroll #{i}: before={before} after={after} "
+            "clickedLoadMore={clicked} btnText={text}".format(
+                i=i,
+                before=before,
+                after=after,
+                clicked=clicked_load_more,
+                text=btn_text or "None",
             )
         )
+
+        if i >= 3 and not button_seen and not debug_dumped:
+            html = page.content()
+            Path(debug_html).write_text(html, encoding="utf-8")
+            page.screenshot(path=debug_screenshot, full_page=True)
+            log_visible_plus_texts(page)
+            debug_dumped = True
 
         if after == before:
             stable_rounds += 1
@@ -341,13 +440,21 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
-        page = browser.new_page(locale="fr-CA")
-        page.goto(args.url, wait_until="domcontentloaded", timeout=60000)
+        context = browser.new_context(locale="fr-CA", user_agent=DEFAULT_USER_AGENT)
+        page = context.new_page()
+        try:
+            page.goto(args.url, wait_until="networkidle", timeout=60000)
+        except PlaywrightTimeoutError:
+            page.goto(args.url, wait_until="domcontentloaded", timeout=60000)
 
         close_popups(page)
         warm_up_page(page)
         wait_for_products(page)
-        stopped_by_stable = load_all_products(page)
+        stopped_by_stable = load_all_products(
+            page,
+            debug_html=args.debug_html,
+            debug_screenshot=args.debug_screenshot,
+        )
         container = find_products_container(page)
         total_links = len(list_visible_product_urls(page, container))
         if stopped_by_stable and total_links < 200:
@@ -360,6 +467,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             html = page.content()
             Path(args.debug_html).write_text(html, encoding="utf-8")
             page.screenshot(path=args.debug_screenshot, full_page=True)
+            context.close()
             browser.close()
             raise RuntimeError(
                 "Aucun produit trouvé. "
@@ -377,6 +485,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             json.dump(output, handle, ensure_ascii=False, indent=2)
 
         print(f"{len(products)} produits enregistrés dans {args.output}")
+        context.close()
         browser.close()
 
     return 0
