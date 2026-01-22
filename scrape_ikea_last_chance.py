@@ -500,42 +500,56 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             return 0
 
-    api_url_template, captured_headers = capture_api_request(args.url, headed=headed)
-    print(f"Captured API URL: {api_url_template}")
-
-    parsed_url = urlsplit(api_url_template)
-    query_pairs = parse_qsl(parsed_url.query, keep_blank_values=True)
-    start_key, end_key = detect_pagination_params(query_pairs)
-    start_value, end_value = parse_pagination_values(
-        query_pairs, start_key, end_key
-    )
-    step = max(end_value - start_value, 1)
-    print(f"step size: {step}")
-
-    headers = merge_headers(captured_headers)
-
-    products: List[Dict[str, Any]] = []
-    start = start_value
-    end = end_value
-
-    while True:
-        updated_query = update_query_params(
-            query_pairs, start_key, end_key, start, end
+    try:
+        api_url_template, captured_headers = capture_api_request(
+            args.url, headed=headed
         )
-        updated_url = urlunsplit(
-            parsed_url._replace(query=urlencode(updated_query, doseq=True))
+        use_api = True
+    except Exception as exc:
+        print(
+            f"[WARN] Capture API impossible: {exc} -> fallback DOM 'Montrer plus'"
         )
-        payload = fetch_json(updated_url, headers)
-        items = find_product_list(payload)
-        print(f"Fetch start={start} end={end} -> items {len(items)}")
-        if not items:
-            break
-        for item in items:
-            products.append(build_product(item))
-        start += step
-        end += step
+        use_api = False
 
-    print(f"Total produits collectés = {len(products)}")
+    if use_api:
+        print(f"Captured API URL: {api_url_template}")
+
+        parsed_url = urlsplit(api_url_template)
+        query_pairs = parse_qsl(parsed_url.query, keep_blank_values=True)
+        start_key, end_key = detect_pagination_params(query_pairs)
+        start_value, end_value = parse_pagination_values(
+            query_pairs, start_key, end_key
+        )
+        step = max(end_value - start_value, 1)
+        print(f"step size: {step}")
+
+        headers = merge_headers(captured_headers)
+
+        products: List[Dict[str, Any]] = []
+        start = start_value
+        end = end_value
+
+        while True:
+            updated_query = update_query_params(
+                query_pairs, start_key, end_key, start, end
+            )
+            updated_url = urlunsplit(
+                parsed_url._replace(query=urlencode(updated_query, doseq=True))
+            )
+            payload = fetch_json(updated_url, headers)
+            items = find_product_list(payload)
+            print(f"Fetch start={start} end={end} -> items {len(items)}")
+            if not items:
+                break
+            for item in items:
+                products.append(build_product(item))
+            start += step
+            end += step
+
+        print(f"Total produits collectés = {len(products)}")
+    else:
+        products = scrape_products_from_page(args.url, headed=headed)
+        print(f"Total produits collectés via DOM = {len(products)}")
 
     output = {
         "source": args.url,
