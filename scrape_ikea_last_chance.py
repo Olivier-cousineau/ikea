@@ -86,22 +86,61 @@ def wait_for_products(page) -> None:
 
 
 def load_all_products(page) -> None:
-    show_more = page.locator(
-        "button:has-text('Show more'), button:has-text('Afficher plus')"
-    ).first
-    for _ in range(200):
+    button_selector = (
+        "button:has-text('Show more'), button:has-text('Voir plus'), "
+        "button:has-text('Afficher plus')"
+    )
+    attempts_without_growth = 0
+    product_links = page.locator("a[href*='/p/']")
+
+    for i in range(1, 201):
+        button = page.locator(button_selector).first
         try:
-            if show_more.is_visible(timeout=1500):
-                show_more.click(timeout=5000)
-                page.wait_for_timeout(600)
-                page.mouse.wheel(0, 2500)
-                page.wait_for_timeout(600)
-            else:
+            if button.count() == 0:
+                break
+            if not button.is_visible(timeout=1500):
+                break
+            if not button.is_enabled():
                 break
         except PlaywrightTimeoutError:
             break
         except Exception:
             break
+
+        before = product_links.count()
+        try:
+            button.click(timeout=5000)
+        except PlaywrightTimeoutError:
+            break
+        except Exception:
+            break
+
+        page.wait_for_timeout(800)
+        page.mouse.wheel(0, 2500)
+        page.wait_for_timeout(800)
+
+        try:
+            page.wait_for_function(
+                "prev => document.querySelectorAll(\"a[href*='/p/']\").length > prev",
+                arg=before,
+                timeout=10000,
+            )
+        except Exception:
+            pass
+
+        after = product_links.count()
+        print(f"Load more click #{i}: before={before} after={after}")
+
+        if after <= before:
+            attempts_without_growth += 1
+        else:
+            attempts_without_growth = 0
+
+        if attempts_without_growth >= 3:
+            break
+
+    total_links = product_links.count()
+    print(f"Load more ended: totalLinks={total_links}")
 
 
 def extract_products(page, base_url: str) -> List[Dict[str, Any]]:
