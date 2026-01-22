@@ -26,6 +26,8 @@ DEFAULT_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Safari/537.36"
 )
+NO_PRODUCTS_HTML = Path("outputs/debug/ikea_no_products.html")
+NO_PRODUCTS_SCREENSHOT = Path("outputs/debug/ikea_no_products.png")
 
 
 def norm_space(value: Optional[str]) -> str:
@@ -45,6 +47,7 @@ def close_overlays(page) -> None:
         "button:has-text('Accept')",
         "button:has-text('Tout accepter')",
         "button:has-text('Accepter')",
+        "button:has-text('Accepter les cookies')",
         "button:has-text('OK')",
         "button:has-text('Fermer')",
         "button:has-text('Continuer')",
@@ -52,11 +55,16 @@ def close_overlays(page) -> None:
         "[role='button']:has-text('Accept')",
         "[role='button']:has-text('Tout accepter')",
         "[role='button']:has-text('Accepter')",
+        "[role='button']:has-text('Accepter les cookies')",
         "[role='button']:has-text('OK')",
         "[role='button']:has-text('Fermer')",
         "[role='button']:has-text('Continuer')",
         "button[aria-label*='close' i]",
         "button[aria-label*='fermer' i]",
+        "button#onetrust-accept-btn-handler",
+        "button[aria-label*='cookie' i]",
+        "[id*='cookie' i] button",
+        "[id*='consent' i] button",
     ]
     for selector in selectors:
         try:
@@ -98,6 +106,42 @@ def wait_for_products(page) -> None:
         )
     except Exception:
         pass
+
+
+def debug_dump_no_products(page) -> None:
+    NO_PRODUCTS_HTML.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        html = page.content()
+    except Exception:
+        html = ""
+    NO_PRODUCTS_HTML.write_text(html, encoding="utf-8")
+    try:
+        page.screenshot(path=str(NO_PRODUCTS_SCREENSHOT), full_page=True)
+    except Exception:
+        pass
+    if html:
+        print("Debug HTML (3000 premiers caractères):")
+        print(html[:3000])
+
+
+def wait_for_product_list(page) -> bool:
+    selector_list = [
+        "div.plp-product-list_products",
+        "#product-list",
+        "section#product-list",
+        "[data-testid*='plp-product']",
+        "a[href*='/p/']",
+    ]
+    combined_selector = ", ".join(selector_list)
+    try:
+        page.wait_for_selector(combined_selector, timeout=45000)
+        return True
+    except PlaywrightTimeoutError:
+        debug_dump_no_products(page)
+        return False
+    except Exception:
+        debug_dump_no_products(page)
+        return False
 
 
 def find_products_container(page):
@@ -172,7 +216,21 @@ def list_visible_product_urls(page, container) -> List[str]:
 
 
 def count_product_cards(page) -> int:
-    return page.locator("div.plp-product-list_products > *").count()
+    primary_count = None
+    if page.locator("div.plp-product-list_products").count() > 0:
+        primary_count = page.locator("div.plp-product-list_products > *").count()
+        if primary_count > 0:
+            return primary_count
+
+    secondary_count = None
+    if page.locator("#product-list").count() > 0:
+        secondary_count = page.locator("#product-list a[href*='/p/']").count()
+        if secondary_count > 0:
+            return secondary_count
+
+    fallback_count = page.locator("a[href*='/p/']").count()
+    counts = [count for count in [primary_count, secondary_count, fallback_count] if count]
+    return max(counts, default=fallback_count)
 
 
 def get_show_more_button(page):
@@ -270,9 +328,25 @@ def load_all_products(page, debug_html: str, debug_screenshot: str) -> bool:
     stable_rounds = 0
     button_seen = False
     debug_dumped = False
+    attempted_zero_recovery = False
 
     for i in range(1, 301):
         before = count_product_cards(page)
+        if before == 0 and not attempted_zero_recovery:
+            attempted_zero_recovery = True
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(2000)
+            after_zero_retry = count_product_cards(page)
+            if after_zero_retry == 0:
+                html = page.content()
+                Path(debug_html).write_text(html, encoding="utf-8")
+                page.screenshot(path=debug_screenshot, full_page=True)
+                print(
+                    "Aucun produit détecté après tentative de récupération. "
+                    "Debug dump effectué."
+                )
+                break
+            before = after_zero_retry
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(1200)
 
@@ -421,7 +495,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         close_overlays(page)
         warm_up_page(page)
-        wait_for_products(page)
+        if not wait_for_product_list(page):
+            print(
+                "Liste produits introuvable après attente. "
+                f"Debug dump: {NO_PRODUCTS_HTML} / {NO_PRODUCTS_SCREENSHOT}"
+            )
+            context.close()
+            browser.close()
+            return 1
         stopped_by_stable = load_all_products(
             page,
             debug_html=args.debug_html,
