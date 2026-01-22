@@ -20,6 +20,7 @@ DEFAULT_URL = (
     "?filters=f-availability%3AAVAILABLE_IN_STORE"
 )
 DEFAULT_DEBUG_HTML = "debug_ikea_last_chance.html"
+DEFAULT_DEBUG_SCREENSHOT = "debug_ikea_last_chance.png"
 
 
 def norm_space(value: Optional[str]) -> str:
@@ -51,6 +52,37 @@ def close_popups(page) -> None:
             continue
         except Exception:
             continue
+
+
+def warm_up_page(page) -> None:
+    try:
+        page.wait_for_load_state("networkidle", timeout=10000)
+    except PlaywrightTimeoutError:
+        pass
+    except Exception:
+        pass
+
+    for _ in range(3):
+        page.mouse.wheel(0, 2500)
+        page.wait_for_timeout(800)
+
+
+def wait_for_products(page) -> None:
+    try:
+        page.wait_for_selector("a[href*='/p/']", timeout=60000)
+        return
+    except PlaywrightTimeoutError:
+        pass
+    except Exception:
+        pass
+
+    try:
+        page.wait_for_function(
+            "document.querySelectorAll(\"a[href*='/p/']\").length >= 5",
+            timeout=60000,
+        )
+    except Exception:
+        pass
 
 
 def load_all_products(page) -> None:
@@ -143,6 +175,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=DEFAULT_DEBUG_HTML,
         help="Chemin du snapshot HTML en cas d'echec",
     )
+    parser.add_argument(
+        "--debug-screenshot",
+        default=DEFAULT_DEBUG_SCREENSHOT,
+        help="Chemin du screenshot en cas d'echec",
+    )
     return parser.parse_args(argv)
 
 
@@ -157,16 +194,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         page.goto(args.url, wait_until="domcontentloaded", timeout=60000)
 
         close_popups(page)
+        warm_up_page(page)
+        wait_for_products(page)
         load_all_products(page)
 
         products = extract_products(page, base_url="https://www.ikea.com")
         if not products:
             html = page.content()
             Path(args.debug_html).write_text(html, encoding="utf-8")
+            page.screenshot(path=args.debug_screenshot, full_page=True)
             browser.close()
             raise RuntimeError(
                 "Aucun produit trouvé. "
-                f"Snapshot HTML sauvegardé: {args.debug_html}"
+                f"Snapshot HTML sauvegardé: {args.debug_html}. "
+                f"Screenshot sauvegardé: {args.debug_screenshot}"
             )
 
         output = {
