@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -17,10 +18,13 @@ from urllib.request import Request, urlopen
 
 DEFAULT_URL = "https://www.ikea.com/ca/fr/cat/last-chance/"
 DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Safari/537.36"
 )
+DEFAULT_LOCALE = "fr-CA"
+DEFAULT_TIMEZONE = "America/Toronto"
+DEFAULT_VIEWPORT = {"width": 1280, "height": 800}
 DEBUG_SCREENSHOT = "playwright_debug.png"
 DEBUG_HTML = "playwright_debug.html"
 DEBUG_REQUESTS = "playwright_debug_requests.txt"
@@ -35,7 +39,81 @@ DEFAULT_HEADERS = {
 }
 
 
-def capture_api_request(page_url: str) -> Tuple[str, Dict[str, str]]:
+def should_use_headed(flag: bool) -> bool:
+    if flag:
+        return True
+    return os.getenv("HEADED", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def create_context(playwright: Any, headed: bool) -> Tuple[Any, Any]:
+    browser = playwright.chromium.launch(headless=not headed)
+    context = browser.new_context(
+        user_agent=DEFAULT_USER_AGENT,
+        locale=DEFAULT_LOCALE,
+        timezone_id=DEFAULT_TIMEZONE,
+        viewport=DEFAULT_VIEWPORT,
+    )
+    return browser, context
+
+
+def dismiss_consent(page: Any) -> None:
+    for label in ("Accepter", "Tout accepter", "OK", "Fermer", "Continuer"):
+        locator = page.locator(f"text={label}")
+        if locator.count():
+            try:
+                if locator.first.is_visible():
+                    locator.first.click(timeout=1500)
+            except Exception:
+                continue
+
+
+def load_more_until_done(page: Any) -> None:
+    button_selector = (
+        "button:has-text('Montrer plus'), "
+        "button:has-text('Show more'), "
+        "[role=button]:has-text('Montrer plus'), "
+        "[role=button]:has-text('Show more')"
+    )
+    max_clicks = 50
+    clicks = 0
+    last_count = 0
+    while clicks < max_clicks:
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(1500)
+        button = page.locator(button_selector).first
+        if not button.count():
+            break
+        try:
+            if not button.is_visible():
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(1000)
+            button.scroll_into_view_if_needed(timeout=2000)
+            current_count = page.locator("a[href*='/p/']").count()
+            button.click(timeout=2000)
+            page.wait_for_timeout(1500)
+            try:
+                page.wait_for_function(
+                    "count => document.querySelectorAll(\"a[href*='/p/']\").length > count",
+                    arg=current_count,
+                    timeout=8000,
+                )
+            except Exception:
+                pass
+            updated_count = page.locator("a[href*='/p/']").count()
+            if updated_count <= last_count and updated_count <= current_count:
+                break
+            last_count = updated_count
+            clicks += 1
+        except Exception:
+            try:
+                page.evaluate("element => element.click()", button)
+                clicks += 1
+                page.wait_for_timeout(1500)
+            except Exception:
+                break
+
+
+def capture_api_request(page_url: str, headed: bool) -> Tuple[str, Dict[str, str]]:
     from playwright.sync_api import sync_playwright
 
     captured_url: Optional[str] = None
@@ -89,45 +167,17 @@ def capture_api_request(page_url: str) -> Tuple[str, Dict[str, str]]:
                 maybe_capture(response_url, headers)
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
-        context = browser.new_context(user_agent=DEFAULT_USER_AGENT)
+        browser, context = create_context(playwright, headed=headed)
         page = context.new_page()
         page.on("request", handle_request)
         page.on("response", handle_response)
         page.goto(page_url, wait_until="domcontentloaded")
 
-        for label in ("Accepter", "Tout accepter", "OK", "Fermer", "Continuer"):
-            locator = page.locator(f"text={label}")
-            if locator.count():
-                try:
-                    if locator.first.is_visible():
-                        locator.first.click(timeout=1500)
-                except Exception:
-                    continue
+        dismiss_consent(page)
 
         page.wait_for_selector("a[href*='/p/']", timeout=45000)
 
-        for _ in range(3):
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(1500)
-
-        show_more_locator = page.locator(
-            "button:has-text('Montrer plus'), "
-            "button:has-text('Show more'), "
-            "[role=button]:has-text('Montrer plus')"
-        ).first
-        if show_more_locator.count():
-            try:
-                show_more_locator.scroll_into_view_if_needed(timeout=2000)
-                show_more_locator.click(timeout=2000)
-            except Exception:
-                try:
-                    page.evaluate(
-                        "element => element.click()",
-                        show_more_locator,
-                    )
-                except Exception:
-                    pass
+        load_more_until_done(page)
 
         start_time = time.monotonic()
         timeout_seconds = 60
@@ -175,6 +225,96 @@ def capture_api_request(page_url: str) -> Tuple[str, Dict[str, str]]:
         )
 
     return captured_url, captured_headers
+
+
+def scrape_products_from_page(
+    page_url: str,
+    headed: bool,
+) -> List[Dict[str, Any]]:
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser, context = create_context(playwright, headed=headed)
+        page = context.new_page()
+        page.goto(page_url, wait_until="domcontentloaded")
+        dismiss_consent(page)
+        page.wait_for_selector("a[href*='/p/']", timeout=45000)
+        load_more_until_done(page)
+
+        payloads: List[Any] = []
+        next_data = page.evaluate("() => window.__NEXT_DATA__ || null")
+        if next_data:
+            payloads.append(next_data)
+        nuxt_data = page.evaluate("() => window.__NUXT__ || null")
+        if nuxt_data:
+            payloads.append(nuxt_data)
+        for script in page.locator(
+            "script[type='application/ld+json']"
+        ).all_inner_texts():
+            try:
+                payloads.append(json.loads(script))
+            except json.JSONDecodeError:
+                continue
+
+        items: List[Dict[str, Any]] = []
+        for payload in payloads:
+            items = find_product_list(payload)
+            if items:
+                break
+
+        products: List[Dict[str, Any]] = []
+        if items:
+            for item in items:
+                products.append(build_product(item))
+
+        if not products:
+            link_locator = page.locator("a[href*='/p/']")
+            link_count = link_locator.count()
+            seen: set[str] = set()
+            for idx in range(link_count):
+                link = link_locator.nth(idx)
+                href = link.get_attribute("href") or ""
+                if not href:
+                    continue
+                if not href.startswith("http"):
+                    href = f"https://www.ikea.com{href}"
+                if href in seen:
+                    continue
+                seen.add(href)
+                try:
+                    text = link.inner_text().strip()
+                except Exception:
+                    text = ""
+                name = None
+                type_name = None
+                if text:
+                    lines = [line.strip() for line in text.splitlines() if line.strip()]
+                    if lines:
+                        name = lines[0]
+                    if len(lines) > 1:
+                        type_name = lines[1]
+                image = None
+                img_locator = link.locator("img").first
+                if img_locator.count():
+                    image = (
+                        img_locator.get_attribute("src")
+                        or img_locator.get_attribute("data-src")
+                        or img_locator.get_attribute("data-srcset")
+                    )
+                products.append(
+                    {
+                        "name": name,
+                        "typeName": type_name,
+                        "price": None,
+                        "url": href,
+                        "image": image,
+                    }
+                )
+
+        context.close()
+        browser.close()
+
+    return products
 
 
 def extract_headers(headers: Dict[str, str]) -> Dict[str, str]:
@@ -318,15 +458,49 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default="ikea_last_chance.json",
         help="Chemin du fichier JSON de sortie",
     )
+    parser.add_argument(
+        "--headed",
+        action="store_true",
+        help="Lance Playwright avec headless=False (ou HEADED=1).",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+    headed = should_use_headed(args.headed)
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    api_url_template, captured_headers = capture_api_request(args.url)
+    if headed:
+        try:
+            products = scrape_products_from_page(args.url, headed=True)
+        except Exception as exc:
+            print(
+                f"Erreur Playwright headed, fallback API: {exc}",
+                file=sys.stderr,
+            )
+            products = []
+        if products:
+            print(
+                f"Total produits collectés via Playwright = {len(products)}"
+            )
+            output = {
+                "source": args.url,
+                "count": len(products),
+                "products": products,
+            }
+            with output_path.open("w", encoding="utf-8") as handle:
+                json.dump(output, handle, ensure_ascii=False, indent=2)
+            print(
+                "{count} produits enregistrés dans {output}.".format(
+                    count=len(products),
+                    output=args.output,
+                )
+            )
+            return 0
+
+    api_url_template, captured_headers = capture_api_request(args.url, headed=headed)
     print(f"Captured API URL: {api_url_template}")
 
     parsed_url = urlsplit(api_url_template)
