@@ -1,0 +1,28 @@
+name: Scrape IKEA Last Chance
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run scraper
+        run: |
+          python scrape_ikea_last_chance.py \
+            --url "https://www.ikea.com/ca/fr/cat/last-chance/?filters=f-availability%3AAVAILABLE_IN_STORE" \
+            --output "ikea_last_chance.json"
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: ikea-last-chance
+          path: ikea_last_chance.json
