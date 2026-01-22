@@ -31,14 +31,7 @@ NO_PRODUCTS_SCREENSHOT = Path("outputs/debug/ikea_no_products.png")
 
 
 def norm_space(value: Optional[str]) -> str:
-    return re.sub(r"\s+", " ", (value or "").strip())
-
-
-def parse_price(text: str) -> Optional[str]:
-    match = re.search(r"\$\s*[\d.,]+", text)
-    if not match:
-        return None
-    return match.group(0).strip()
+    return re.sub(r"\s+", " ", (value or "").replace("\xa0", " ").strip())
 
 
 def close_overlays(page) -> None:
@@ -90,24 +83,6 @@ def warm_up_page(page) -> None:
         page.wait_for_timeout(800)
 
 
-def wait_for_products(page) -> None:
-    try:
-        page.wait_for_selector("a[href*='/p/']", timeout=60000)
-        return
-    except PlaywrightTimeoutError:
-        pass
-    except Exception:
-        pass
-
-    try:
-        page.wait_for_function(
-            "document.querySelectorAll(\"a[href*='/p/']\").length >= 5",
-            timeout=60000,
-        )
-    except Exception:
-        pass
-
-
 def debug_dump_no_products(page) -> None:
     NO_PRODUCTS_HTML.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -125,16 +100,16 @@ def debug_dump_no_products(page) -> None:
 
 
 def wait_for_product_list(page) -> bool:
-    selector_list = [
-        "div.plp-product-list_products",
-        "#product-list",
-        "section#product-list",
-        "[data-testid*='plp-product']",
-        "a[href*='/p/']",
-    ]
-    combined_selector = ", ".join(selector_list)
     try:
-        page.wait_for_selector(combined_selector, timeout=45000)
+        page.wait_for_selector("div.plp-product-list_products", timeout=45000)
+        return True
+    except PlaywrightTimeoutError:
+        pass
+    except Exception:
+        pass
+
+    try:
+        page.wait_for_selector("a[href*='/p/']", timeout=45000)
         return True
     except PlaywrightTimeoutError:
         debug_dump_no_products(page)
@@ -144,93 +119,31 @@ def wait_for_product_list(page) -> bool:
         return False
 
 
-def find_products_container(page):
-    main = page.locator("main")
-    if main.count() == 0:
-        main = page.locator("body")
-
-    candidates = main.locator(
-        "xpath=.//*[self::div or self::section or self::ul or self::ol]"
-        "[.//a[contains(@href,'/p/')]]"
-    )
-    best_candidate = None
-    best_count = 0
-    for i in range(min(candidates.count(), 25)):
-        candidate = candidates.nth(i)
-        try:
-            count = candidate.locator("a[href*='/p/']").count()
-        except Exception:
-            continue
-        if count > best_count:
-            best_candidate = candidate
-            best_count = count
-
-    if best_candidate is not None and best_count >= 5:
-        return best_candidate
+def get_total_count(page) -> Optional[int]:
+    try:
+        data_category = page.locator(".js-product-list").get_attribute(
+            "data-category"
+        )
+    except Exception:
+        data_category = None
+    if not data_category:
+        return None
+    try:
+        payload = json.loads(data_category)
+    except json.JSONDecodeError:
+        return None
+    total_count = payload.get("totalCount")
+    if isinstance(total_count, int):
+        return total_count
     return None
 
 
-def list_visible_product_urls(page, container) -> List[str]:
-    handle = None
-    if container is not None:
-        try:
-            handle = container.element_handle()
-        except Exception:
-            handle = None
-
-    return page.evaluate(
-        """
-        (rootEl) => {
-            const root =
-                rootEl || document.querySelector("main") || document.body || document;
-            const anchors = Array.from(root.querySelectorAll("a[href*='/p/']"));
-            const urls = [];
-            const seen = new Set();
-            for (const anchor of anchors) {
-                const rect = anchor.getBoundingClientRect();
-                const style = window.getComputedStyle(anchor);
-                const visible =
-                    rect.width > 0 &&
-                    rect.height > 0 &&
-                    style &&
-                    style.display !== "none" &&
-                    style.visibility !== "hidden";
-                if (!visible) {
-                    continue;
-                }
-                const href = anchor.href || anchor.getAttribute("href");
-                if (!href || !href.includes("/p/")) {
-                    continue;
-                }
-                if (seen.has(href)) {
-                    continue;
-                }
-                seen.add(href);
-                urls.push(href);
-            }
-            return urls;
-        }
-        """,
-        handle,
-    )
-
-
 def count_product_cards(page) -> int:
-    primary_count = None
-    if page.locator("div.plp-product-list_products").count() > 0:
-        primary_count = page.locator("div.plp-product-list_products > *").count()
-        if primary_count > 0:
-            return primary_count
-
-    secondary_count = None
-    if page.locator("#product-list").count() > 0:
-        secondary_count = page.locator("#product-list a[href*='/p/']").count()
-        if secondary_count > 0:
-            return secondary_count
-
-    fallback_count = page.locator("a[href*='/p/']").count()
-    counts = [count for count in [primary_count, secondary_count, fallback_count] if count]
-    return max(counts, default=fallback_count)
+    primary = page.locator("div.plp-product-list_products > *").count()
+    if primary:
+        return primary
+    fallback = page.locator("a[href*='/p/']").count()
+    return fallback
 
 
 def get_show_more_button(page):
@@ -238,7 +151,11 @@ def get_show_more_button(page):
         page.locator(
             "div.plp-catalog-bottom-container button:has-text('Montrer plus')"
         ).first,
+        page.locator(
+            "div.plp-catalog-bottom-container button:has-text('Show more')"
+        ).first,
         page.locator("[role='button']:has-text('Montrer plus')").first,
+        page.locator("[role='button']:has-text('Show more')").first,
     ]
     for candidate in candidates:
         try:
@@ -278,108 +195,47 @@ def click_show_more_if_possible(page) -> Dict[str, Optional[str]]:
         except Exception:
             return {"clicked": False, "text": btn_text, "found": True}
 
-    try:
-        page.wait_for_load_state("networkidle", timeout=10000)
-    except PlaywrightTimeoutError:
-        pass
-    except Exception:
-        pass
-
     return {"clicked": True, "text": btn_text, "found": True}
 
 
-def log_visible_plus_texts(page, limit: int = 50) -> None:
-    texts = page.evaluate(
-        """
-        (limit) => {
-            const matcher = /plus/i;
-            const elements = Array.from(document.querySelectorAll("body *"));
-            const output = [];
-            for (const el of elements) {
-                const text = (el.innerText || "").trim();
-                if (!text || !matcher.test(text)) {
-                    continue;
-                }
-                const rect = el.getBoundingClientRect();
-                const style = window.getComputedStyle(el);
-                const visible =
-                    rect.width > 0 &&
-                    rect.height > 0 &&
-                    style &&
-                    style.display !== "none" &&
-                    style.visibility !== "hidden";
-                if (!visible) {
-                    continue;
-                }
-                output.push(text);
-            }
-            return output.slice(-limit);
-        }
-        """,
-        limit,
-    )
-    if texts:
-        print("Derniers textes visibles contenant 'plus':")
-        for entry in texts:
-            print(f"- {entry}")
-
-
-def load_all_products(page, debug_html: str, debug_screenshot: str) -> bool:
+def load_all_products(page, total_count: Optional[int]) -> None:
     stable_rounds = 0
-    button_seen = False
-    debug_dumped = False
-    attempted_zero_recovery = False
-
     for i in range(1, 301):
         before = count_product_cards(page)
-        if before == 0 and not attempted_zero_recovery:
-            attempted_zero_recovery = True
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(2000)
-            after_zero_retry = count_product_cards(page)
-            if after_zero_retry == 0:
-                html = page.content()
-                Path(debug_html).write_text(html, encoding="utf-8")
-                page.screenshot(path=debug_screenshot, full_page=True)
-                print(
-                    "Aucun produit détecté après tentative de récupération. "
-                    "Debug dump effectué."
+        if total_count is not None and before >= total_count:
+            print(
+                "Load loop #{i}: before={before} target={target} reached".format(
+                    i=i,
+                    before=before,
+                    target=total_count,
                 )
-                break
-            before = after_zero_retry
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(1200)
+            )
+            break
 
-        close_overlays(page)
         click_info = click_show_more_if_possible(page)
-        clicked_load_more = click_info["clicked"]
-        if click_info["found"]:
-            button_seen = True
+        clicked = bool(click_info["clicked"])
+        btn_text = click_info["text"]
 
-        try:
-            page.wait_for_load_state("networkidle", timeout=15000)
-        except PlaywrightTimeoutError:
-            pass
-        except Exception:
-            pass
+        if click_info["found"]:
+            try:
+                page.wait_for_timeout(800)
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except PlaywrightTimeoutError:
+                pass
+            except Exception:
+                pass
 
         after = count_product_cards(page)
         print(
-            "Scroll/Load #{i}: before={before} after={after} "
-            "clickedLoadMore={clicked}".format(
+            "Load loop #{i}: before={before} after={after} clicked={clicked} "
+            "btnText={btn_text}".format(
                 i=i,
                 before=before,
                 after=after,
-                clicked=clicked_load_more,
+                clicked=clicked,
+                btn_text=btn_text,
             )
         )
-
-        if i >= 3 and not button_seen and not debug_dumped:
-            html = page.content()
-            Path(debug_html).write_text(html, encoding="utf-8")
-            page.screenshot(path=debug_screenshot, full_page=True)
-            log_visible_plus_texts(page)
-            debug_dumped = True
 
         if after <= before:
             stable_rounds += 1
@@ -389,71 +245,113 @@ def load_all_products(page, debug_html: str, debug_screenshot: str) -> bool:
         if stable_rounds >= 3:
             break
 
-    page.mouse.wheel(0, 600)
-    page.wait_for_timeout(800)
-    total_links = count_product_cards(page)
-    print(f"Scroll ended: totalItems={total_links}")
-    return stable_rounds >= 3
+
+def parse_image_src(srcset: Optional[str]) -> Optional[str]:
+    if not srcset:
+        return None
+    parts = [part.strip() for part in srcset.split(",") if part.strip()]
+    if not parts:
+        return None
+    first = parts[0].split(" ")[0]
+    return first or None
 
 
 def extract_products(page, base_url: str) -> List[Dict[str, Any]]:
-    container = find_products_container(page)
-    if container is not None:
-        cards = container.locator("a[href*='/p/']")
-    else:
-        cards = page.locator("main a[href*='/p/']")
-    count = cards.count()
-    if count == 0:
-        return []
+    cards = page.locator("div.plp-product-list_products > *")
+    if cards.count() == 0:
+        cards = page.locator("a[href*='/p/']")
 
-    items: List[Dict[str, Any]] = []
-    seen: set[str] = set()
-    for i in range(min(count, 5000)):
+    badge_labels = {"Meilleur vendeur", "Best seller"}
+    items_by_url: Dict[str, Dict[str, Any]] = {}
+
+    for card in cards.all():
         try:
-            anchor = cards.nth(i)
-            href = anchor.get_attribute("href") or ""
-            if "/p/" not in href:
+            anchor = card.locator("a[href*='/p/']").first
+            href = anchor.get_attribute("href") if anchor.count() else None
+            if not href or "/p/" not in href:
                 continue
             url = href if href.startswith("http") else urljoin(base_url, href)
-            if url in seen:
-                continue
-            seen.add(url)
-
-            item_container = anchor.locator(
-                "xpath=ancestor::*[self::li or self::article or self::div][1]"
-            )
-            raw_text = ""
-            if item_container.count():
-                raw_text = item_container.inner_text(timeout=2000)
-            if not raw_text:
-                raw_text = anchor.inner_text(timeout=2000)
-            text = norm_space(raw_text)
 
             name = None
-            if text:
-                name = text.split("$")[0].strip() or None
+            try:
+                name = norm_space(card.locator("h3").first.inner_text())
+            except Exception:
+                name = None
+            if not name:
+                try:
+                    name = norm_space(
+                        card.locator("[data-testid*='product-title']")
+                        .first.inner_text()
+                    )
+                except Exception:
+                    name = None
+            if not name:
+                try:
+                    label = anchor.get_attribute("aria-label")
+                except Exception:
+                    label = None
+                if label:
+                    label = norm_space(label)
+                    label = re.split(r"\s+\$|\s+[-|]\s+", label)[0].strip()
+                    name = label or None
+
+            if name in badge_labels:
+                name = None
+
+            type_name = None
+            try:
+                type_text = norm_space(card.locator("p").first.inner_text())
+            except Exception:
+                type_text = None
+            if type_text and not re.search(r"Maintenant|Jamais|Now|never", type_text):
+                type_name = type_text
+
+            price = None
+            try:
+                price = norm_space(
+                    card.locator("[data-testid*='price']").first.inner_text()
+                )
+            except Exception:
+                price = None
+            if not price:
+                try:
+                    price = norm_space(
+                        card.locator("span:has-text('$')").first.inner_text()
+                    )
+                except Exception:
+                    price = None
 
             image = None
-            if item_container.count():
-                try:
-                    img = item_container.locator("img").first
-                    image = img.get_attribute("src") or img.get_attribute("data-src")
-                except Exception:
-                    image = None
+            try:
+                img = card.locator("img").first
+                image = img.get_attribute("src") or parse_image_src(
+                    img.get_attribute("srcset")
+                )
+            except Exception:
+                image = None
 
-            items.append(
-                {
-                    "name": name,
-                    "url": url,
-                    "price": parse_price(text),
-                    "typeName": None,
-                    "image": image,
-                }
-            )
+            item = {
+                "name": name,
+                "url": url,
+                "price": price,
+                "typeName": type_name,
+                "image": image,
+            }
+
+            existing = items_by_url.get(url)
+            if existing is None:
+                items_by_url[url] = item
+            else:
+                existing_score = int(bool(existing.get("name"))) + int(
+                    bool(existing.get("price"))
+                )
+                new_score = int(bool(name)) + int(bool(price))
+                if new_score > existing_score:
+                    items_by_url[url] = item
         except Exception:
             continue
 
-    return items
+    return list(items_by_url.values())
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -503,17 +401,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             context.close()
             browser.close()
             return 1
-        stopped_by_stable = load_all_products(
-            page,
-            debug_html=args.debug_html,
-            debug_screenshot=args.debug_screenshot,
-        )
-        container = find_products_container(page)
-        total_links = len(list_visible_product_urls(page, container))
-        if stopped_by_stable and total_links < 200:
-            html = page.content()
-            Path(args.debug_html).write_text(html, encoding="utf-8")
-            page.screenshot(path=args.debug_screenshot, full_page=True)
+
+        total_count = get_total_count(page)
+        load_all_products(page, total_count)
 
         products = extract_products(page, base_url="https://www.ikea.com")
         if not products:
@@ -537,7 +427,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         with output_path.open("w", encoding="utf-8") as handle:
             json.dump(output, handle, ensure_ascii=False, indent=2)
 
-        print(f"{len(products)} produits enregistrés dans {args.output}")
+        print(
+            "{count} produits enregistrés dans {output}. totalCount={total}.".format(
+                count=len(products),
+                output=args.output,
+                total=total_count,
+            )
+        )
         context.close()
         browser.close()
 
