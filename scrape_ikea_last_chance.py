@@ -24,6 +24,8 @@ DEFAULT_USER_AGENT = (
 DEBUG_SCREENSHOT = "playwright_debug.png"
 DEBUG_HTML = "playwright_debug.html"
 DEBUG_REQUESTS = "playwright_debug_requests.txt"
+DEBUG_RESPONSES = "network_responses_filtered.json"
+DEBUG_LINKS = "playwright_debug_links.txt"
 DEFAULT_HEADERS = {
     "User-Agent": DEFAULT_USER_AGENT,
     "Accept": "application/json",
@@ -38,33 +40,97 @@ def capture_api_request(page_url: str) -> Tuple[str, Dict[str, str]]:
 
     captured_url: Optional[str] = None
     captured_headers: Dict[str, str] = {}
+    fallback_url: Optional[str] = None
+    fallback_headers: Dict[str, str] = {}
     captured_event = Event()
     request_log: List[str] = []
+    response_log: List[str] = []
+    response_filtered: List[str] = []
+
+    capture_patterns = (
+        "product-list-page",
+        "more-products",
+        "pip",
+        "sik.search.blue.cdtapps.com",
+    )
+
+    def url_matches(url: str) -> bool:
+        return any(pattern in url for pattern in capture_patterns)
+
+    def maybe_capture(url: str, headers: Dict[str, str]) -> None:
+        nonlocal captured_url, captured_headers, fallback_url, fallback_headers
+        if "product-list-page/more-products" in url:
+            captured_url = url
+            captured_headers = extract_headers(headers)
+            captured_event.set()
+            return
+        if "product-list-page" in url and fallback_url is None:
+            fallback_url = url
+            fallback_headers = extract_headers(headers)
 
     def handle_request(request: Any) -> None:
-        nonlocal captured_url, captured_headers
         request_url = request.url
-        if "product-list-page/more-products" in request_url:
-            if not captured_event.is_set():
-                captured_url = request_url
-                headers = request.headers or {}
-                captured_headers = extract_headers(headers)
-                captured_event.set()
-        if (
-            "product-list-page" in request_url
-            or "sik.search.blue.cdtapps.com" in request_url
-        ):
+        if url_matches(request_url):
             request_log.append(request_url)
+            if not captured_event.is_set():
+                headers = request.headers or {}
+                maybe_capture(request_url, headers)
+
+    def handle_response(response: Any) -> None:
+        response_url = response.url
+        if "product-list-page" in response_url or (
+            "sik.search.blue.cdtapps.com" in response_url
+        ):
+            response_filtered.append(response_url)
+        if url_matches(response_url):
+            response_log.append(response_url)
+            if not captured_event.is_set():
+                headers = response.request.headers or {}
+                maybe_capture(response_url, headers)
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
         context = browser.new_context(user_agent=DEFAULT_USER_AGENT)
         page = context.new_page()
         page.on("request", handle_request)
+        page.on("response", handle_response)
         page.goto(page_url, wait_until="domcontentloaded")
 
+        for label in ("Accepter", "Tout accepter", "OK", "Fermer", "Continuer"):
+            locator = page.locator(f"text={label}")
+            if locator.count():
+                try:
+                    if locator.first.is_visible():
+                        locator.first.click(timeout=1500)
+                except Exception:
+                    continue
+
+        page.wait_for_selector("a[href*='/p/']", timeout=45000)
+
+        for _ in range(3):
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(1500)
+
+        show_more_locator = page.locator(
+            "button:has-text('Montrer plus'), "
+            "button:has-text('Show more'), "
+            "[role=button]:has-text('Montrer plus')"
+        ).first
+        if show_more_locator.count():
+            try:
+                show_more_locator.scroll_into_view_if_needed(timeout=2000)
+                show_more_locator.click(timeout=2000)
+            except Exception:
+                try:
+                    page.evaluate(
+                        "element => element.click()",
+                        show_more_locator,
+                    )
+                except Exception:
+                    pass
+
         start_time = time.monotonic()
-        timeout_seconds = 30
+        timeout_seconds = 60
         while not captured_event.is_set():
             if time.monotonic() - start_time >= timeout_seconds:
                 break
@@ -75,14 +141,36 @@ def capture_api_request(page_url: str) -> Tuple[str, Dict[str, str]]:
             html = page.content()
             Path(DEBUG_HTML).write_text(html, encoding="utf-8")
             Path(DEBUG_REQUESTS).write_text(
-                "\n".join(request_log), encoding="utf-8"
+                "\n".join(request_log + response_log), encoding="utf-8"
+            )
+            Path(DEBUG_RESPONSES).write_text(
+                json.dumps(response_filtered, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            product_links = page.locator("a[href*='/p/']")
+            link_count = min(product_links.count(), 10)
+            link_details: List[str] = []
+            for idx in range(link_count):
+                link = product_links.nth(idx)
+                href = link.get_attribute("href") or ""
+                try:
+                    text = link.inner_text().strip()
+                except Exception:
+                    text = ""
+                link_details.append(f"{idx + 1}. {text} ({href})")
+            Path(DEBUG_LINKS).write_text(
+                "\n".join(link_details), encoding="utf-8"
             )
         context.close()
         browser.close()
 
+    if not captured_url and fallback_url:
+        captured_url = fallback_url
+        captured_headers = fallback_headers
+
     if not captured_url:
         raise RuntimeError(
-            "Aucune requête capturée après 30s. "
+            "Aucune requête capturée après 60s. "
             f"Debug: {DEBUG_SCREENSHOT}, {DEBUG_HTML}, {DEBUG_REQUESTS}"
         )
 
