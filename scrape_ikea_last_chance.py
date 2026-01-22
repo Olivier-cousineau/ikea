@@ -85,66 +85,92 @@ def wait_for_products(page) -> None:
         pass
 
 
-def load_all_products(page) -> None:
+def find_products_container(page):
+    main = page.locator("main")
+    if main.count() == 0:
+        main = page.locator("body")
+
+    candidates = main.locator(
+        "xpath=.//*[self::div or self::section or self::ul or self::ol]"
+        "[.//a[contains(@href,'/p/')]]"
+    )
+    best_candidate = None
+    best_count = 0
+    for i in range(min(candidates.count(), 25)):
+        candidate = candidates.nth(i)
+        try:
+            count = candidate.locator("a[href*='/p/']").count()
+        except Exception:
+            continue
+        if count > best_count:
+            best_candidate = candidate
+            best_count = count
+
+    if best_candidate is not None and best_count >= 5:
+        return best_candidate
+    return None
+
+
+def load_all_products(page) -> bool:
     button_selector = (
         "button:has-text('Show more'), button:has-text('Voir plus'), "
-        "button:has-text('Afficher plus')"
+        "button:has-text('Load more'), button:has-text('Afficher plus')"
     )
-    attempts_without_growth = 0
-    product_links = page.locator("a[href*='/p/']")
+    stable_rounds = 0
+    container = find_products_container(page)
 
-    for i in range(1, 201):
+    def count_products() -> int:
+        if container is not None:
+            return container.locator("a[href*='/p/']").count()
+        return page.locator("main a[href*='/p/']").count()
+
+    for i in range(1, 301):
+        before = count_products()
+        page.mouse.wheel(0, 3000)
+        page.wait_for_timeout(800)
+
+        clicked_load_more = False
         button = page.locator(button_selector).first
         try:
-            if button.count() == 0:
-                break
-            if not button.is_visible(timeout=1500):
-                break
-            if not button.is_enabled():
-                break
+            if button.count() > 0 and button.is_visible(timeout=1500) and button.is_enabled():
+                button.click(timeout=5000)
+                clicked_load_more = True
+                page.wait_for_timeout(800)
+                page.mouse.wheel(0, 3000)
+                page.wait_for_timeout(800)
         except PlaywrightTimeoutError:
-            break
-        except Exception:
-            break
-
-        before = product_links.count()
-        try:
-            button.click(timeout=5000)
-        except PlaywrightTimeoutError:
-            break
-        except Exception:
-            break
-
-        page.wait_for_timeout(800)
-        page.mouse.wheel(0, 2500)
-        page.wait_for_timeout(800)
-
-        try:
-            page.wait_for_function(
-                "prev => document.querySelectorAll(\"a[href*='/p/']\").length > prev",
-                arg=before,
-                timeout=10000,
-            )
+            pass
         except Exception:
             pass
 
-        after = product_links.count()
-        print(f"Load more click #{i}: before={before} after={after}")
+        after = count_products()
+        print(
+            "Scroll #{i}: before={before} after={after} clickedLoadMore={clicked}".format(
+                i=i, before=before, after=after, clicked=clicked_load_more
+            )
+        )
 
-        if after <= before:
-            attempts_without_growth += 1
+        if after == before:
+            stable_rounds += 1
         else:
-            attempts_without_growth = 0
+            stable_rounds = 0
 
-        if attempts_without_growth >= 3:
+        if stable_rounds >= 8:
             break
 
-    total_links = product_links.count()
-    print(f"Load more ended: totalLinks={total_links}")
+    page.mouse.wheel(0, 600)
+    page.wait_for_timeout(800)
+    total_links = count_products()
+    print(f"Scroll ended: totalLinks={total_links}")
+    return stable_rounds >= 8
 
 
 def extract_products(page, base_url: str) -> List[Dict[str, Any]]:
-    cards = page.locator("a[href*='/p/']")
+    container = find_products_container(page)
+    if container is not None:
+        cards = container.locator("a[href*='/p/']")
+    else:
+        cards = page.locator("main a[href*='/p/']")
     count = cards.count()
     if count == 0:
         return []
@@ -162,12 +188,12 @@ def extract_products(page, base_url: str) -> List[Dict[str, Any]]:
                 continue
             seen.add(url)
 
-            container = anchor.locator(
+            item_container = anchor.locator(
                 "xpath=ancestor::*[self::li or self::article or self::div][1]"
             )
             raw_text = ""
-            if container.count():
-                raw_text = container.inner_text(timeout=2000)
+            if item_container.count():
+                raw_text = item_container.inner_text(timeout=2000)
             if not raw_text:
                 raw_text = anchor.inner_text(timeout=2000)
             text = norm_space(raw_text)
@@ -177,9 +203,9 @@ def extract_products(page, base_url: str) -> List[Dict[str, Any]]:
                 name = text.split("$")[0].strip() or None
 
             image = None
-            if container.count():
+            if item_container.count():
                 try:
-                    img = container.locator("img").first
+                    img = item_container.locator("img").first
                     image = img.get_attribute("src") or img.get_attribute("data-src")
                 except Exception:
                     image = None
@@ -235,7 +261,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         close_popups(page)
         warm_up_page(page)
         wait_for_products(page)
-        load_all_products(page)
+        stopped_by_stable = load_all_products(page)
+        container = find_products_container(page)
+        if container is not None:
+            total_links = container.locator("a[href*='/p/']").count()
+        else:
+            total_links = page.locator("main a[href*='/p/']").count()
+        if stopped_by_stable and total_links < 200:
+            html = page.content()
+            Path(args.debug_html).write_text(html, encoding="utf-8")
+            page.screenshot(path=args.debug_screenshot, full_page=True)
 
         products = extract_products(page, base_url="https://www.ikea.com")
         if not products:
