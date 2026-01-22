@@ -148,18 +148,21 @@ def count_product_cards(page) -> int:
 
 def get_show_more_button(page):
     candidates = [
-        page.locator(
-            "div.plp-catalog-bottom-container button:has-text('Montrer plus')"
-        ).first,
-        page.locator(
-            "div.plp-catalog-bottom-container button:has-text('Show more')"
-        ).first,
+        page.locator("button:has-text('Montrer plus')").first,
+        page.locator("button:has-text('Afficher plus')").first,
+        page.locator("button:has-text('Show more')").first,
         page.locator("[role='button']:has-text('Montrer plus')").first,
         page.locator("[role='button']:has-text('Show more')").first,
+        page.locator("div.plp-catalog-bottom-container button")
+        .filter(has_text="Montrer")
+        .first,
+        page.locator("div.plp-catalog-bottom-container [role='button']")
+        .filter(has_text="Montrer")
+        .first,
     ]
     for candidate in candidates:
         try:
-            if candidate.count() > 0 and candidate.is_visible(timeout=1500):
+            if candidate.count() > 0:
                 return candidate
         except Exception:
             continue
@@ -169,6 +172,19 @@ def get_show_more_button(page):
 def click_show_more_if_possible(page) -> Dict[str, Optional[str]]:
     button = get_show_more_button(page)
     if button is None:
+        try:
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(500)
+        except Exception:
+            pass
+        button = get_show_more_button(page)
+
+    if button is None or button.count() == 0:
+        try:
+            button_texts = page.locator("button").all_inner_texts()
+            print("Show more introuvable. Derniers boutons:", button_texts[-5:])
+        except Exception:
+            print("Show more introuvable. Impossible de lire les boutons.")
         return {"clicked": False, "text": None, "found": False}
 
     btn_text = None
@@ -176,12 +192,6 @@ def click_show_more_if_possible(page) -> Dict[str, Optional[str]]:
         btn_text = norm_space(button.inner_text(timeout=1500))
     except Exception:
         btn_text = None
-
-    try:
-        if not button.is_visible(timeout=1500) or not button.is_enabled():
-            return {"clicked": False, "text": btn_text, "found": True}
-    except Exception:
-        return {"clicked": False, "text": btn_text, "found": True}
 
     try:
         button.scroll_into_view_if_needed()
@@ -260,6 +270,7 @@ def extract_products(page, base_url: str) -> List[Dict[str, Any]]:
     cards = page.locator("div.plp-product-list_products > *")
     if cards.count() == 0:
         cards = page.locator("a[href*='/p/']")
+    links = page.locator("a[href*='/p/']").all()
 
     badge_labels = {"Meilleur vendeur", "Best seller"}
     items_by_url: Dict[str, Dict[str, Any]] = {}
@@ -351,6 +362,67 @@ def extract_products(page, base_url: str) -> List[Dict[str, Any]]:
         except Exception:
             continue
 
+    for link in links:
+        try:
+            href = link.get_attribute("href")
+            if not href or "/p/" not in href:
+                continue
+            url = href if href.startswith("http") else urljoin(base_url, href)
+
+            name = None
+            try:
+                aria = link.get_attribute("aria-label")
+                if aria:
+                    name = norm_space(aria)
+            except Exception:
+                name = None
+
+            parent = link.locator("xpath=ancestor::*[self::article or self::div][1]")
+
+            if not name:
+                try:
+                    name = norm_space(parent.locator("h3").first.inner_text())
+                except Exception:
+                    name = None
+
+            price = None
+            try:
+                price = norm_space(
+                    parent.locator("span:has-text('$')").first.inner_text()
+                )
+            except Exception:
+                price = None
+
+            image = None
+            try:
+                img = parent.locator("img").first
+                image = img.get_attribute("src") or parse_image_src(
+                    img.get_attribute("srcset")
+                )
+            except Exception:
+                image = None
+
+            item = {
+                "name": name,
+                "url": url,
+                "price": price,
+                "typeName": None,
+                "image": image,
+            }
+
+            existing = items_by_url.get(url)
+            if existing is None:
+                items_by_url[url] = item
+            else:
+                existing_score = int(bool(existing.get("name"))) + int(
+                    bool(existing.get("price"))
+                )
+                new_score = int(bool(name)) + int(bool(price))
+                if new_score > existing_score:
+                    items_by_url[url] = item
+        except Exception:
+            continue
+
     return list(items_by_url.values())
 
 
@@ -405,8 +477,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         total_count = get_total_count(page)
         load_all_products(page, total_count)
 
+        try:
+            count_links = page.locator("a[href*='/p/']").count()
+        except Exception:
+            count_links = 0
+
         products = extract_products(page, base_url="https://www.ikea.com")
-        if not products:
+        if not products and count_links == 0:
             html = page.content()
             Path(args.debug_html).write_text(html, encoding="utf-8")
             page.screenshot(path=args.debug_screenshot, full_page=True)
@@ -416,6 +493,23 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "Aucun produit trouvé. "
                 f"Snapshot HTML sauvegardé: {args.debug_html}. "
                 f"Screenshot sauvegardé: {args.debug_screenshot}"
+            )
+
+        print(
+            "Résumé extraction: count_links=/p/={links} count_products_final={count}".format(
+                links=count_links,
+                count=len(products),
+            )
+        )
+        example_entries = products[:3]
+        for idx, item in enumerate(example_entries, start=1):
+            print(
+                "Exemple {idx}: url={url} name={name} price={price}".format(
+                    idx=idx,
+                    url=item.get("url"),
+                    name=item.get("name"),
+                    price=item.get("price"),
+                )
             )
 
         output = {
