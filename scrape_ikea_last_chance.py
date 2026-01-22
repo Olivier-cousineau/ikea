@@ -379,6 +379,20 @@ def detect_pagination_params(query_pairs: List[Tuple[str, str]]) -> Tuple[str, s
     raise ValueError("Impossible d'identifier les paramètres start/end.")
 
 
+def detect_page_param(query_pairs: List[Tuple[str, str]]) -> Tuple[str, int]:
+    candidates = ("page", "pagenumber", "pageindex")
+    lowered = [(key.lower(), key, value) for key, value in query_pairs]
+    for candidate in candidates:
+        match = next(
+            (original for lower, original, _ in lowered if lower == candidate),
+            None,
+        )
+        if match:
+            value = next(value for key, value in query_pairs if key == match)
+            return match, int(value)
+    raise ValueError("Impossible d'identifier un paramètre de page.")
+
+
 def update_query_params(
     query_pairs: List[Tuple[str, str]],
     start_key: str,
@@ -392,6 +406,20 @@ def update_query_params(
             updated.append((key, str(start)))
         elif key == end_key:
             updated.append((key, str(end)))
+        else:
+            updated.append((key, value))
+    return updated
+
+
+def update_single_query_param(
+    query_pairs: List[Tuple[str, str]],
+    target_key: str,
+    target_value: int,
+) -> List[Tuple[str, str]]:
+    updated: List[Tuple[str, str]] = []
+    for key, value in query_pairs:
+        if key == target_key:
+            updated.append((key, str(target_value)))
         else:
             updated.append((key, value))
     return updated
@@ -531,35 +559,60 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         parsed_url = urlsplit(api_url_template)
         query_pairs = parse_qsl(parsed_url.query, keep_blank_values=True)
-        start_key, end_key = detect_pagination_params(query_pairs)
-        start_value, end_value = parse_pagination_values(
-            query_pairs, start_key, end_key
-        )
-        step = max(end_value - start_value, 1)
-        print(f"step size: {step}")
-
         headers = merge_headers(captured_headers)
-
         products: List[Dict[str, Any]] = []
-        start = start_value
-        end = end_value
 
-        while True:
-            updated_query = update_query_params(
-                query_pairs, start_key, end_key, start, end
+        try:
+            start_key, end_key = detect_pagination_params(query_pairs)
+            start_value, end_value = parse_pagination_values(
+                query_pairs, start_key, end_key
             )
-            updated_url = urlunsplit(
-                parsed_url._replace(query=urlencode(updated_query, doseq=True))
-            )
-            payload = fetch_json(updated_url, headers)
-            items = find_product_list(payload)
-            print(f"Fetch start={start} end={end} -> items {len(items)}")
-            if not items:
-                break
-            for item in items:
-                products.append(build_product(item))
-            start += step
-            end += step
+            step = max(end_value - start_value, 1)
+            print(f"step size: {step}")
+
+            start = start_value
+            end = end_value
+
+            while True:
+                updated_query = update_query_params(
+                    query_pairs, start_key, end_key, start, end
+                )
+                updated_url = urlunsplit(
+                    parsed_url._replace(query=urlencode(updated_query, doseq=True))
+                )
+                payload = fetch_json(updated_url, headers)
+                items = find_product_list(payload)
+                print(f"Fetch start={start} end={end} -> items {len(items)}")
+                if not items:
+                    break
+                for item in items:
+                    products.append(build_product(item))
+                start += step
+                end += step
+        except ValueError:
+            page_key, page_value = detect_page_param(query_pairs)
+            seen_urls: set[str] = set()
+            page = page_value
+            max_pages = 200
+
+            while page <= max_pages:
+                updated_query = update_single_query_param(
+                    query_pairs, page_key, page
+                )
+                updated_url = urlunsplit(
+                    parsed_url._replace(query=urlencode(updated_query, doseq=True))
+                )
+                if updated_url in seen_urls:
+                    break
+                seen_urls.add(updated_url)
+                payload = fetch_json(updated_url, headers)
+                items = find_product_list(payload)
+                print(f"Fetch page={page} -> items {len(items)}")
+                if not items:
+                    break
+                for item in items:
+                    products.append(build_product(item))
+                page += 1
 
         print(f"Total produits collectés = {len(products)}")
     else:
