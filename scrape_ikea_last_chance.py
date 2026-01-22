@@ -111,23 +111,66 @@ def find_products_container(page):
     return None
 
 
+def list_visible_product_urls(page, container) -> List[str]:
+    handle = None
+    if container is not None:
+        try:
+            handle = container.element_handle()
+        except Exception:
+            handle = None
+
+    return page.evaluate(
+        """
+        (rootEl) => {
+            const root =
+                rootEl || document.querySelector("main") || document.body || document;
+            const anchors = Array.from(root.querySelectorAll("a[href*='/p/']"));
+            const urls = [];
+            const seen = new Set();
+            for (const anchor of anchors) {
+                const rect = anchor.getBoundingClientRect();
+                const style = window.getComputedStyle(anchor);
+                const visible =
+                    rect.width > 0 &&
+                    rect.height > 0 &&
+                    style &&
+                    style.display !== "none" &&
+                    style.visibility !== "hidden";
+                if (!visible) {
+                    continue;
+                }
+                const href = anchor.href || anchor.getAttribute("href");
+                if (!href || !href.includes("/p/")) {
+                    continue;
+                }
+                if (seen.has(href)) {
+                    continue;
+                }
+                seen.add(href);
+                urls.push(href);
+            }
+            return urls;
+        }
+        """,
+        handle,
+    )
+
+
 def load_all_products(page) -> bool:
     button_selector = (
-        "button:has-text('Show more'), button:has-text('Voir plus'), "
-        "button:has-text('Load more'), button:has-text('Afficher plus')"
+        "button:has-text('Montrer plus'), button:has-text('Show more'), "
+        "button:has-text('Voir plus'), button:has-text('Afficher plus')"
     )
     stable_rounds = 0
     container = find_products_container(page)
 
     def count_products() -> int:
-        if container is not None:
-            return container.locator("a[href*='/p/']").count()
-        return page.locator("main a[href*='/p/']").count()
+        return len(list_visible_product_urls(page, container))
 
     for i in range(1, 301):
         before = count_products()
-        page.mouse.wheel(0, 3000)
-        page.wait_for_timeout(800)
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(1000)
 
         clicked_load_more = False
         button = page.locator(button_selector).first
@@ -135,9 +178,52 @@ def load_all_products(page) -> bool:
             if button.count() > 0 and button.is_visible(timeout=1500) and button.is_enabled():
                 button.click(timeout=5000)
                 clicked_load_more = True
-                page.wait_for_timeout(800)
-                page.mouse.wheel(0, 3000)
-                page.wait_for_timeout(800)
+                page.wait_for_timeout(1000)
+                try:
+                    root_handle = None
+                    if container is not None:
+                        try:
+                            root_handle = container.element_handle()
+                        except Exception:
+                            root_handle = None
+                    page.wait_for_function(
+                        """
+                        (rootEl, beforeCount) => {
+                            const root =
+                                rootEl ||
+                                document.querySelector("main") ||
+                                document.body ||
+                                document;
+                            const anchors = Array.from(
+                                root.querySelectorAll("a[href*='/p/']")
+                            );
+                            const seen = new Set();
+                            for (const anchor of anchors) {
+                                const rect = anchor.getBoundingClientRect();
+                                const style = window.getComputedStyle(anchor);
+                                const visible =
+                                    rect.width > 0 &&
+                                    rect.height > 0 &&
+                                    style &&
+                                    style.display !== "none" &&
+                                    style.visibility !== "hidden";
+                                if (!visible) {
+                                    continue;
+                                }
+                                const href = anchor.href || anchor.getAttribute("href");
+                                if (!href || !href.includes("/p/")) {
+                                    continue;
+                                }
+                                seen.add(href);
+                            }
+                            return seen.size > beforeCount;
+                        }
+                        """,
+                        arg=(root_handle, before),
+                        timeout=15000,
+                    )
+                except Exception:
+                    pass
         except PlaywrightTimeoutError:
             pass
         except Exception:
@@ -263,10 +349,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         wait_for_products(page)
         stopped_by_stable = load_all_products(page)
         container = find_products_container(page)
-        if container is not None:
-            total_links = container.locator("a[href*='/p/']").count()
-        else:
-            total_links = page.locator("main a[href*='/p/']").count()
+        total_links = len(list_visible_product_urls(page, container))
         if stopped_by_stable and total_links < 200:
             html = page.content()
             Path(args.debug_html).write_text(html, encoding="utf-8")
