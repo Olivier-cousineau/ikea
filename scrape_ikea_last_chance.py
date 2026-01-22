@@ -7,105 +7,125 @@ import argparse
 import json
 import re
 import sys
-from typing import Any, Dict, Iterable, List, Optional
-from urllib.request import Request, urlopen
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from urllib.parse import urljoin
+
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 
 
 DEFAULT_URL = (
     "https://www.ikea.com/ca/fr/cat/last-chance/"
     "?filters=f-availability%3AAVAILABLE_IN_STORE"
 )
+DEFAULT_DEBUG_HTML = "debug_ikea_last_chance.html"
 
 
-def fetch_html(url: str) -> str:
-    request = Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
-        },
-    )
-    with urlopen(request) as response:
-        return response.read().decode("utf-8")
+def norm_space(value: Optional[str]) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip())
 
 
-def extract_next_data(html: str) -> Dict[str, Any]:
-    match = re.search(
-        r'__NEXT_DATA__" type="application/json">(.*?)</script>',
-        html,
-        re.DOTALL,
-    )
+def parse_price(text: str) -> Optional[str]:
+    match = re.search(r"\$\s*[\d.,]+", text)
     if not match:
-        raise ValueError("Impossible de trouver __NEXT_DATA__ dans la page HTML.")
-    return json.loads(match.group(1))
-
-
-def iter_dicts(data: Any) -> Iterable[Dict[str, Any]]:
-    if isinstance(data, dict):
-        yield data
-        for value in data.values():
-            yield from iter_dicts(value)
-    elif isinstance(data, list):
-        for item in data:
-            yield from iter_dicts(item)
-
-
-def parse_price(value: Any) -> Optional[str]:
-    if value is None:
         return None
-    if isinstance(value, (int, float)):
-        return str(value)
-    if isinstance(value, str):
-        return value.strip() or None
-    if isinstance(value, dict):
-        for key in ("price", "priceValue", "priceNumeral", "currentPrice", "formatted"):
-            if key in value:
-                parsed = parse_price(value[key])
-                if parsed:
-                    return parsed
-    return None
+    return match.group(0).strip()
 
 
-def build_product(candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    merged = dict(candidate)
-    if isinstance(candidate.get("product"), dict):
-        merged.update(candidate["product"])
-
-    name = merged.get("name") or merged.get("productName")
-    url = merged.get("pipUrl") or merged.get("productUrl") or merged.get("url")
-    if not (name and url):
-        return None
-
-    price = parse_price(
-        merged.get("price")
-        or merged.get("priceValue")
-        or merged.get("priceNumeral")
-        or merged.get("currentPrice")
-    )
-
-    return {
-        "name": str(name).strip(),
-        "url": str(url).strip(),
-        "price": price,
-        "typeName": merged.get("typeName") or merged.get("type"),
-    }
+def close_popups(page) -> None:
+    selectors = [
+        "button:has-text('Accept all')",
+        "button:has-text('Accept')",
+        "button:has-text('Tout accepter')",
+        "button:has-text('Accepter')",
+        "button[aria-label*='close' i]",
+        "button[aria-label*='fermer' i]",
+    ]
+    for selector in selectors:
+        try:
+            button = page.locator(selector).first
+            if button.is_visible(timeout=1500):
+                button.click(timeout=1500)
+        except PlaywrightTimeoutError:
+            continue
+        except Exception:
+            continue
 
 
-def extract_products(data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    products: List[Dict[str, Any]] = []
+def load_all_products(page) -> None:
+    show_more = page.locator(
+        "button:has-text('Show more'), button:has-text('Afficher plus')"
+    ).first
+    for _ in range(200):
+        try:
+            if show_more.is_visible(timeout=1500):
+                show_more.click(timeout=5000)
+                page.wait_for_timeout(600)
+                page.mouse.wheel(0, 2500)
+                page.wait_for_timeout(600)
+            else:
+                break
+        except PlaywrightTimeoutError:
+            break
+        except Exception:
+            break
+
+
+def extract_products(page, base_url: str) -> List[Dict[str, Any]]:
+    cards = page.locator("a[href*='/p/']")
+    count = cards.count()
+    if count == 0:
+        return []
+
+    items: List[Dict[str, Any]] = []
     seen: set[str] = set()
-    for entry in iter_dicts(data):
-        product = build_product(entry)
-        if not product:
+    for i in range(min(count, 5000)):
+        try:
+            anchor = cards.nth(i)
+            href = anchor.get_attribute("href") or ""
+            if "/p/" not in href:
+                continue
+            url = href if href.startswith("http") else urljoin(base_url, href)
+            if url in seen:
+                continue
+            seen.add(url)
+
+            container = anchor.locator(
+                "xpath=ancestor::*[self::li or self::article or self::div][1]"
+            )
+            raw_text = ""
+            if container.count():
+                raw_text = container.inner_text(timeout=2000)
+            if not raw_text:
+                raw_text = anchor.inner_text(timeout=2000)
+            text = norm_space(raw_text)
+
+            name = None
+            if text:
+                name = text.split("$")[0].strip() or None
+
+            image = None
+            if container.count():
+                try:
+                    img = container.locator("img").first
+                    image = img.get_attribute("src") or img.get_attribute("data-src")
+                except Exception:
+                    image = None
+
+            items.append(
+                {
+                    "name": name,
+                    "url": url,
+                    "price": parse_price(text),
+                    "typeName": None,
+                    "image": image,
+                }
+            )
+        except Exception:
             continue
-        key = product["url"]
-        if key in seen:
-            continue
-        seen.add(key)
-        products.append(product)
-    return products
+
+    return items
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -118,25 +138,49 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default="ikea_last_chance.json",
         help="Chemin du fichier JSON de sortie",
     )
+    parser.add_argument(
+        "--debug-html",
+        default=DEFAULT_DEBUG_HTML,
+        help="Chemin du snapshot HTML en cas d'echec",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
-    html = fetch_html(args.url)
-    data = extract_next_data(html)
-    products = extract_products(data)
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    output = {
-        "source": args.url,
-        "count": len(products),
-        "products": products,
-    }
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page(locale="fr-CA")
+        page.goto(args.url, wait_until="domcontentloaded", timeout=60000)
 
-    with open(args.output, "w", encoding="utf-8") as handle:
-        json.dump(output, handle, ensure_ascii=False, indent=2)
+        close_popups(page)
+        load_all_products(page)
 
-    print(f"{len(products)} produits enregistrés dans {args.output}")
+        products = extract_products(page, base_url="https://www.ikea.com")
+        if not products:
+            html = page.content()
+            Path(args.debug_html).write_text(html, encoding="utf-8")
+            browser.close()
+            raise RuntimeError(
+                "Aucun produit trouvé. "
+                f"Snapshot HTML sauvegardé: {args.debug_html}"
+            )
+
+        output = {
+            "source": args.url,
+            "count": len(products),
+            "products": products,
+        }
+
+        with output_path.open("w", encoding="utf-8") as handle:
+            json.dump(output, handle, ensure_ascii=False, indent=2)
+
+        print(f"{len(products)} produits enregistrés dans {args.output}")
+        browser.close()
+
     return 0
 
 
