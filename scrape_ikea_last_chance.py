@@ -1,429 +1,58 @@
 #!/usr/bin/env python3
-"""Scrape IKEA Last Chance listings from a category URL."""
+"""Scrape IKEA Last Chance listings from the IKEA product list API."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import urljoin
-
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-from playwright.sync_api import sync_playwright
+from urllib.request import Request, urlopen
 
 
-DEFAULT_URL = (
-    "https://www.ikea.com/ca/fr/cat/last-chance/"
-    "?filters=f-availability%3AAVAILABLE_IN_STORE"
-)
-DEFAULT_DEBUG_HTML = "debug_ikea.html"
-DEFAULT_DEBUG_SCREENSHOT = "debug_ikea.png"
+DEFAULT_URL = "https://www.ikea.com/ca/fr/cat/last-chance/"
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Safari/537.36"
 )
-NO_PRODUCTS_HTML = Path("outputs/debug/ikea_no_products.html")
-NO_PRODUCTS_SCREENSHOT = Path("outputs/debug/ikea_no_products.png")
+API_URL_TEMPLATE = (
+    "https://sik.search.blue.cdtapps.com/ca/fr/product-list-page"
+    "?category={category}&page={page}"
+)
+CATEGORY = "last-chance"
 
 
-def norm_space(value: Optional[str]) -> str:
-    return re.sub(r"\s+", " ", (value or "").replace("\xa0", " ").strip())
+def fetch_page(page: int, category: str = CATEGORY) -> Dict[str, Any]:
+    url = API_URL_TEMPLATE.format(category=category, page=page)
+    request = Request(
+        url,
+        headers={
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept": "application/json",
+        },
+    )
+    with urlopen(request, timeout=30) as response:
+        return json.load(response)
 
 
-def close_overlays(page) -> None:
-    selectors = [
-        "button:has-text('Accept all')",
-        "button:has-text('Accept')",
-        "button:has-text('Tout accepter')",
-        "button:has-text('Accepter')",
-        "button:has-text('Accepter les cookies')",
-        "button:has-text('OK')",
-        "button:has-text('Fermer')",
-        "button:has-text('Continuer')",
-        "[role='button']:has-text('Accept all')",
-        "[role='button']:has-text('Accept')",
-        "[role='button']:has-text('Tout accepter')",
-        "[role='button']:has-text('Accepter')",
-        "[role='button']:has-text('Accepter les cookies')",
-        "[role='button']:has-text('OK')",
-        "[role='button']:has-text('Fermer')",
-        "[role='button']:has-text('Continuer')",
-        "button[aria-label*='close' i]",
-        "button[aria-label*='fermer' i]",
-        "button#onetrust-accept-btn-handler",
-        "button[aria-label*='cookie' i]",
-        "[id*='cookie' i] button",
-        "[id*='consent' i] button",
-    ]
-    for selector in selectors:
-        try:
-            button = page.locator(selector).first
-            if button.is_visible(timeout=1500):
-                button.click(timeout=1500)
-        except PlaywrightTimeoutError:
-            continue
-        except Exception:
-            continue
-
-
-def warm_up_page(page) -> None:
-    try:
-        page.wait_for_load_state("networkidle", timeout=10000)
-    except PlaywrightTimeoutError:
-        pass
-    except Exception:
-        pass
-
-    for _ in range(3):
-        page.mouse.wheel(0, 2500)
-        page.wait_for_timeout(800)
-
-
-def debug_dump_no_products(page) -> None:
-    NO_PRODUCTS_HTML.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        html = page.content()
-    except Exception:
-        html = ""
-    NO_PRODUCTS_HTML.write_text(html, encoding="utf-8")
-    try:
-        page.screenshot(path=str(NO_PRODUCTS_SCREENSHOT), full_page=True)
-    except Exception:
-        pass
-    if html:
-        print("Debug HTML (3000 premiers caractères):")
-        print(html[:3000])
-
-
-def wait_for_product_list(page) -> bool:
-    try:
-        page.wait_for_selector("div.plp-product-list_products", timeout=45000)
-        return True
-    except PlaywrightTimeoutError:
-        pass
-    except Exception:
-        pass
-
-    try:
-        page.wait_for_selector("a[href*='/p/']", timeout=45000)
-        return True
-    except PlaywrightTimeoutError:
-        debug_dump_no_products(page)
-        return False
-    except Exception:
-        debug_dump_no_products(page)
-        return False
-
-
-def get_total_count(page) -> Optional[int]:
-    try:
-        data_category = page.locator(".js-product-list").get_attribute(
-            "data-category"
-        )
-    except Exception:
-        data_category = None
-    if not data_category:
-        return None
-    try:
-        payload = json.loads(data_category)
-    except json.JSONDecodeError:
-        return None
-    total_count = payload.get("totalCount")
-    if isinstance(total_count, int):
-        return total_count
+def extract_price(product: Dict[str, Any]) -> Optional[Any]:
+    price = product.get("price")
+    if isinstance(price, dict):
+        return price.get("current") or price.get("price")
     return None
 
 
-def count_product_cards(page) -> int:
-    primary = page.locator("div.plp-product-list_products > *").count()
-    if primary:
-        return primary
-    fallback = page.locator("a[href*='/p/']").count()
-    return fallback
-
-
-def get_show_more_button(page):
-    candidates = [
-        page.locator("button:has-text('Montrer plus')").first,
-        page.locator("button:has-text('Afficher plus')").first,
-        page.locator("button:has-text('Show more')").first,
-        page.locator("[role='button']:has-text('Montrer plus')").first,
-        page.locator("[role='button']:has-text('Show more')").first,
-        page.locator("div.plp-catalog-bottom-container button")
-        .filter(has_text="Montrer")
-        .first,
-        page.locator("div.plp-catalog-bottom-container [role='button']")
-        .filter(has_text="Montrer")
-        .first,
-    ]
-    for candidate in candidates:
-        try:
-            if candidate.count() > 0:
-                return candidate
-        except Exception:
-            continue
-    return None
-
-
-def click_show_more_if_possible(page) -> Dict[str, Optional[str]]:
-    button = get_show_more_button(page)
-    if button is None:
-        try:
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(500)
-        except Exception:
-            pass
-        button = get_show_more_button(page)
-
-    if button is None or button.count() == 0:
-        try:
-            button_texts = page.locator("button").all_inner_texts()
-            print("Show more introuvable. Derniers boutons:", button_texts[-5:])
-        except Exception:
-            print("Show more introuvable. Impossible de lire les boutons.")
-        return {"clicked": False, "text": None, "found": False}
-
-    btn_text = None
-    try:
-        btn_text = norm_space(button.inner_text(timeout=1500))
-    except Exception:
-        btn_text = None
-
-    try:
-        button.scroll_into_view_if_needed()
-        button.click(timeout=5000)
-    except Exception:
-        try:
-            handle = button.element_handle()
-            if handle is None:
-                return {"clicked": False, "text": btn_text, "found": True}
-            page.evaluate("(el) => el.click()", handle)
-        except Exception:
-            return {"clicked": False, "text": btn_text, "found": True}
-
-    return {"clicked": True, "text": btn_text, "found": True}
-
-
-def load_all_products(page, total_count: Optional[int]) -> None:
-    stable_rounds = 0
-    for i in range(1, 301):
-        before = count_product_cards(page)
-        if total_count is not None and before >= total_count:
-            print(
-                "Load loop #{i}: before={before} target={target} reached".format(
-                    i=i,
-                    before=before,
-                    target=total_count,
-                )
-            )
-            break
-
-        click_info = click_show_more_if_possible(page)
-        clicked = bool(click_info["clicked"])
-        btn_text = click_info["text"]
-
-        if click_info["found"]:
-            try:
-                page.wait_for_timeout(800)
-                page.wait_for_load_state("networkidle", timeout=10000)
-            except PlaywrightTimeoutError:
-                pass
-            except Exception:
-                pass
-
-        after = count_product_cards(page)
-        print(
-            "Load loop #{i}: before={before} after={after} clicked={clicked} "
-            "btnText={btn_text}".format(
-                i=i,
-                before=before,
-                after=after,
-                clicked=clicked,
-                btn_text=btn_text,
-            )
-        )
-
-        if after <= before:
-            stable_rounds += 1
-        else:
-            stable_rounds = 0
-
-        if stable_rounds >= 3:
-            break
-
-
-def parse_image_src(srcset: Optional[str]) -> Optional[str]:
-    if not srcset:
-        return None
-    parts = [part.strip() for part in srcset.split(",") if part.strip()]
-    if not parts:
-        return None
-    first = parts[0].split(" ")[0]
-    return first or None
-
-
-def extract_products(page, base_url: str) -> List[Dict[str, Any]]:
-    cards = page.locator("div.plp-product-list_products > *")
-    if cards.count() == 0:
-        cards = page.locator("a[href*='/p/']")
-    links = page.locator("a[href*='/p/']").all()
-
-    badge_labels = {"Meilleur vendeur", "Best seller"}
-    items_by_url: Dict[str, Dict[str, Any]] = {}
-
-    for card in cards.all():
-        try:
-            anchor = card.locator("a[href*='/p/']").first
-            href = anchor.get_attribute("href") if anchor.count() else None
-            if not href or "/p/" not in href:
-                continue
-            url = href if href.startswith("http") else urljoin(base_url, href)
-
-            name = None
-            try:
-                name = norm_space(card.locator("h3").first.inner_text())
-            except Exception:
-                name = None
-            if not name:
-                try:
-                    name = norm_space(
-                        card.locator("[data-testid*='product-title']")
-                        .first.inner_text()
-                    )
-                except Exception:
-                    name = None
-            if not name:
-                try:
-                    label = anchor.get_attribute("aria-label")
-                except Exception:
-                    label = None
-                if label:
-                    label = norm_space(label)
-                    label = re.split(r"\s+\$|\s+[-|]\s+", label)[0].strip()
-                    name = label or None
-
-            if name in badge_labels:
-                name = None
-
-            type_name = None
-            try:
-                type_text = norm_space(card.locator("p").first.inner_text())
-            except Exception:
-                type_text = None
-            if type_text and not re.search(r"Maintenant|Jamais|Now|never", type_text):
-                type_name = type_text
-
-            price = None
-            try:
-                price = norm_space(
-                    card.locator("[data-testid*='price']").first.inner_text()
-                )
-            except Exception:
-                price = None
-            if not price:
-                try:
-                    price = norm_space(
-                        card.locator("span:has-text('$')").first.inner_text()
-                    )
-                except Exception:
-                    price = None
-
-            image = None
-            try:
-                img = card.locator("img").first
-                image = img.get_attribute("src") or parse_image_src(
-                    img.get_attribute("srcset")
-                )
-            except Exception:
-                image = None
-
-            item = {
-                "name": name,
-                "url": url,
-                "price": price,
-                "typeName": type_name,
-                "image": image,
-            }
-
-            existing = items_by_url.get(url)
-            if existing is None:
-                items_by_url[url] = item
-            else:
-                existing_score = int(bool(existing.get("name"))) + int(
-                    bool(existing.get("price"))
-                )
-                new_score = int(bool(name)) + int(bool(price))
-                if new_score > existing_score:
-                    items_by_url[url] = item
-        except Exception:
-            continue
-
-    for link in links:
-        try:
-            href = link.get_attribute("href")
-            if not href or "/p/" not in href:
-                continue
-            url = href if href.startswith("http") else urljoin(base_url, href)
-
-            name = None
-            try:
-                aria = link.get_attribute("aria-label")
-                if aria:
-                    name = norm_space(aria)
-            except Exception:
-                name = None
-
-            parent = link.locator("xpath=ancestor::*[self::article or self::div][1]")
-
-            if not name:
-                try:
-                    name = norm_space(parent.locator("h3").first.inner_text())
-                except Exception:
-                    name = None
-
-            price = None
-            try:
-                price = norm_space(
-                    parent.locator("span:has-text('$')").first.inner_text()
-                )
-            except Exception:
-                price = None
-
-            image = None
-            try:
-                img = parent.locator("img").first
-                image = img.get_attribute("src") or parse_image_src(
-                    img.get_attribute("srcset")
-                )
-            except Exception:
-                image = None
-
-            item = {
-                "name": name,
-                "url": url,
-                "price": price,
-                "typeName": None,
-                "image": image,
-            }
-
-            existing = items_by_url.get(url)
-            if existing is None:
-                items_by_url[url] = item
-            else:
-                existing_score = int(bool(existing.get("name"))) + int(
-                    bool(existing.get("price"))
-                )
-                new_score = int(bool(name)) + int(bool(price))
-                if new_score > existing_score:
-                    items_by_url[url] = item
-        except Exception:
-            continue
-
-    return list(items_by_url.values())
+def build_product(product: Dict[str, Any]) -> Dict[str, Any]:
+    link_url = product.get("linkUrl") or ""
+    return {
+        "name": product.get("name"),
+        "typeName": product.get("typeName"),
+        "price": extract_price(product),
+        "url": f"https://www.ikea.com{link_url}",
+        "image": (product.get("image") or {}).get("url"),
+    }
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -436,16 +65,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default="ikea_last_chance.json",
         help="Chemin du fichier JSON de sortie",
     )
-    parser.add_argument(
-        "--debug-html",
-        default=DEFAULT_DEBUG_HTML,
-        help="Chemin du snapshot HTML en cas d'echec",
-    )
-    parser.add_argument(
-        "--debug-screenshot",
-        default=DEFAULT_DEBUG_SCREENSHOT,
-        help="Chemin du screenshot en cas d'echec",
-    )
     return parser.parse_args(argv)
 
 
@@ -454,82 +73,37 @@ def main(argv: Optional[List[str]] = None) -> int:
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
-        context = browser.new_context(locale="fr-CA", user_agent=DEFAULT_USER_AGENT)
-        page = context.new_page()
-        try:
-            page.goto(args.url, wait_until="networkidle", timeout=60000)
-        except PlaywrightTimeoutError:
-            page.goto(args.url, wait_until="domcontentloaded", timeout=60000)
+    products: List[Dict[str, Any]] = []
+    page = 1
 
-        close_overlays(page)
-        warm_up_page(page)
-        if not wait_for_product_list(page):
-            print(
-                "Liste produits introuvable après attente. "
-                f"Debug dump: {NO_PRODUCTS_HTML} / {NO_PRODUCTS_SCREENSHOT}"
-            )
-            context.close()
-            browser.close()
-            return 1
+    while True:
+        payload = fetch_page(page)
+        items = payload.get("products") or []
+        print(f"Fetch page {page} → items {len(items)}")
+        if not items:
+            break
+        for item in items:
+            if isinstance(item, dict):
+                products.append(build_product(item))
+        page += 1
 
-        total_count = get_total_count(page)
-        load_all_products(page, total_count)
+    print(f"Total produits collectés = {len(products)}")
 
-        try:
-            count_links = page.locator("a[href*='/p/']").count()
-        except Exception:
-            count_links = 0
+    output = {
+        "source": args.url,
+        "count": len(products),
+        "products": products,
+    }
 
-        products = extract_products(page, base_url="https://www.ikea.com")
-        if not products and count_links == 0:
-            html = page.content()
-            Path(args.debug_html).write_text(html, encoding="utf-8")
-            page.screenshot(path=args.debug_screenshot, full_page=True)
-            context.close()
-            browser.close()
-            raise RuntimeError(
-                "Aucun produit trouvé. "
-                f"Snapshot HTML sauvegardé: {args.debug_html}. "
-                f"Screenshot sauvegardé: {args.debug_screenshot}"
-            )
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump(output, handle, ensure_ascii=False, indent=2)
 
-        print(
-            "Résumé extraction: count_links=/p/={links} count_products_final={count}".format(
-                links=count_links,
-                count=len(products),
-            )
+    print(
+        "{count} produits enregistrés dans {output}.".format(
+            count=len(products),
+            output=args.output,
         )
-        example_entries = products[:3]
-        for idx, item in enumerate(example_entries, start=1):
-            print(
-                "Exemple {idx}: url={url} name={name} price={price}".format(
-                    idx=idx,
-                    url=item.get("url"),
-                    name=item.get("name"),
-                    price=item.get("price"),
-                )
-            )
-
-        output = {
-            "source": args.url,
-            "count": len(products),
-            "products": products,
-        }
-
-        with output_path.open("w", encoding="utf-8") as handle:
-            json.dump(output, handle, ensure_ascii=False, indent=2)
-
-        print(
-            "{count} produits enregistrés dans {output}. totalCount={total}.".format(
-                count=len(products),
-                output=args.output,
-                total=total_count,
-            )
-        )
-        context.close()
-        browser.close()
+    )
 
     return 0
 
