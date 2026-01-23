@@ -2,6 +2,9 @@ name: Scrape IKEA Last Chance
 
 on:
   workflow_dispatch:
+  schedule:
+    # GitHub Actions schedules run in UTC.
+    - cron: "0 2 * * 1,5"
 
 jobs:
   scrape:
