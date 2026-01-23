@@ -56,7 +56,10 @@ STORE_SEARCH_SELECTORS = [
     "input[placeholder*='Search']",
     "input[aria-label*='Search']",
 ]
-STORE_MODAL_TITLE = "Choisir un magasin"
+STORE_MODAL_TITLES = ("Choisir un magasin", "Choose a store")
+STORE_MODAL_TITLE_REGEX = re.compile(
+    r"Choisir un magasin|Choose a store", flags=re.IGNORECASE
+)
 
 
 def should_use_headed(flag: bool) -> bool:
@@ -121,13 +124,110 @@ def store_modal_is_open(page: Any) -> bool:
                     return True
             except Exception:
                 continue
-    title_locator = page.locator(f"text={STORE_MODAL_TITLE}")
-    if title_locator.count():
+    for title in STORE_MODAL_TITLES:
+        title_locator = page.locator(f"text={title}")
+        if title_locator.count():
+            try:
+                if title_locator.first.is_visible():
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def get_store_modal(page: Any) -> Optional[Any]:
+    dialog = page.locator("[role=dialog]").filter(
+        has_text=STORE_MODAL_TITLE_REGEX
+    )
+    if dialog.count():
+        return dialog.first
+    dialog = page.locator("[role=dialog]")
+    for idx in range(dialog.count()):
+        candidate = dialog.nth(idx)
         try:
-            if title_locator.first.is_visible():
-                return True
+            if candidate.is_visible():
+                return candidate
         except Exception:
-            pass
+            continue
+    for title in STORE_MODAL_TITLES:
+        title_locator = page.locator(f"text={title}").first
+        if title_locator.count():
+            return title_locator
+    return None
+
+
+def scroll_modal_list(modal_locator: Any) -> bool:
+    try:
+        modal_locator.evaluate(
+            """
+            node => {
+              const candidates = [node, ...node.querySelectorAll(
+                '[role="list"], [role="listbox"], ul, ol, div'
+              )];
+              const target = candidates.find(
+                el => el.scrollHeight > el.clientHeight
+              ) || node;
+              const delta = Math.max(target.clientHeight, 300);
+              target.scrollBy(0, delta);
+            }
+            """
+        )
+        return True
+    except Exception:
+        return False
+
+
+def click_store_card(
+    page: Any, expected_label: str, modal_locator: Optional[Any]
+) -> bool:
+    escaped_label = re.escape(expected_label)
+    exact_regex = re.compile(rf"^{escaped_label}$", re.IGNORECASE)
+
+    def try_click() -> bool:
+        candidate = page.get_by_role("button", name=exact_regex)
+        if candidate.count():
+            candidate.first.click()
+            return True
+        candidate = page.get_by_role("link", name=exact_regex)
+        if candidate.count():
+            candidate.first.click()
+            return True
+        text_locator = page.get_by_text(expected_label, exact=True).first
+        if text_locator.count():
+            clickable = text_locator.locator(
+                "xpath=ancestor-or-self::button | "
+                "ancestor-or-self::a | ancestor-or-self::*[@role='button']"
+            ).first
+            if clickable.count():
+                clickable.click()
+                return True
+            text_locator.click()
+            return True
+        card_locator = page.locator(
+            f"div:has-text('{expected_label}')"
+        ).first
+        if card_locator.count():
+            clickable = card_locator.locator(
+                "xpath=ancestor-or-self::button | "
+                "ancestor-or-self::a | ancestor-or-self::*[@role='button']"
+            ).first
+            if clickable.count():
+                clickable.click()
+                return True
+            card_locator.click()
+            return True
+        return False
+
+    if try_click():
+        return True
+
+    for _ in range(5):
+        if modal_locator and modal_locator.count():
+            if not scroll_modal_list(modal_locator):
+                break
+            page.wait_for_timeout(300)
+        if try_click():
+            return True
     return False
 
 
@@ -294,6 +394,7 @@ def set_store(
         print(f"[store] Header avant changement: {header_before}")
 
         open_store_modal(page)
+        modal_locator = get_store_modal(page)
 
         search_input = None
         for selector in STORE_SEARCH_SELECTORS:
@@ -308,20 +409,13 @@ def set_store(
         else:
             print("[store] Aucun champ de recherche trouvé dans le modal.")
 
-        escaped_label = re.escape(target_label)
-        exact_regex = re.compile(rf"^{escaped_label}$", re.IGNORECASE)
-        selection_made = False
-        if page.get_by_role("button", name=exact_regex).count():
-            page.get_by_role("button", name=exact_regex).first.click()
-            selection_made = True
-        elif page.get_by_role("link", name=exact_regex).count():
-            page.get_by_role("link", name=exact_regex).first.click()
-            selection_made = True
-        else:
-            label_locator = page.locator(f"text=/{escaped_label}/i").first
-            if label_locator.count():
-                label_locator.click()
-                selection_made = True
+        selection_made = click_store_card(page, target_label, modal_locator)
+        if not selection_made and search_input:
+            search_input.fill("")
+            page.wait_for_timeout(500)
+            selection_made = click_store_card(
+                page, target_label, modal_locator
+            )
 
         if not selection_made:
             raise RuntimeError(
@@ -337,6 +431,11 @@ def set_store(
         ]
         click_first_visible(page, confirm_selectors)
         page.wait_for_timeout(500)
+        if modal_locator and modal_locator.count():
+            try:
+                modal_locator.wait_for(state="hidden", timeout=5000)
+            except Exception:
+                pass
         page.wait_for_load_state("networkidle", timeout=15000)
 
         header_after = extract_text(page.locator("header").first) or ""
