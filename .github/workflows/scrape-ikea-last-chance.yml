@@ -23,15 +23,17 @@ jobs:
 
       - name: Run scraper
         run: |
+          rm -f "public/IKEA stores.json"
+          mkdir -p public
           python scrape_ikea_last_chance.py \
             --url "https://www.ikea.com/ca/fr/cat/last-chance/?filters=f-availability%3AAVAILABLE_IN_STORE" \
-            --output "ikea_last_chance.json"
+            --output "public/IKEA stores.json"
 
       - name: Upload result
         uses: actions/upload-artifact@v4
         with:
           name: ikea-last-chance
           path: |
-            ikea_last_chance.json
+            public/IKEA stores.json
             debug_ikea_last_chance.html
             debug_ikea_last_chance.png
