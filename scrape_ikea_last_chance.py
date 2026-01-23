@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from pathlib import Path
 from threading import Event
 from typing import Any, Dict, List, Optional, Tuple
@@ -190,19 +191,61 @@ def get_store_modal(page: Any) -> Optional[Any]:
     return None
 
 
-def scroll_modal_list(modal_locator: Any) -> bool:
+def normalize_string(value: str) -> str:
+    value = (value or "").strip().lower()
+    value = "".join(
+        char
+        for char in unicodedata.normalize("NFKD", value)
+        if not unicodedata.combining(char)
+    )
+    return value
+
+
+def find_scroll_container(modal_locator: Any) -> Optional[Any]:
     try:
-        modal_locator.evaluate(
+        handle = modal_locator.evaluate_handle(
             """
-            node => {
-              const candidates = [node, ...node.querySelectorAll(
-                '[role="list"], [role="listbox"], ul, ol, div'
-              )];
-              const target = candidates.find(
-                el => el.scrollHeight > el.clientHeight
-              ) || node;
-              const delta = Math.max(target.clientHeight, 300);
-              target.scrollBy(0, delta);
+            modal => {
+              const ikeaRegex = /IKEA\\s+/i;
+              const elements = Array.from(modal.querySelectorAll('*'));
+              const scrollables = elements.filter(el => {
+                const style = getComputedStyle(el);
+                const scrollable = (
+                  style.overflowY === 'auto' || style.overflowY === 'scroll'
+                );
+                return scrollable && el.scrollHeight > el.clientHeight + 50;
+              });
+              const containsCards = el => {
+                const matches = Array.from(el.querySelectorAll('*'))
+                  .filter(node => ikeaRegex.test(node.textContent || ''));
+                return matches.length >= 2;
+              };
+              const target = scrollables.find(containsCards)
+                || scrollables[0];
+              if (target) {
+                return target;
+              }
+              const firstCard = elements.find(
+                node => ikeaRegex.test(node.textContent || '')
+              );
+              if (firstCard && firstCard.parentElement) {
+                return firstCard.parentElement;
+              }
+              return modal;
+            }
+            """
+        )
+        return handle.as_element()
+    except Exception:
+        return None
+
+
+def scroll_container(container: Any) -> bool:
+    try:
+        container.evaluate(
+            """
+            el => {
+              el.scrollTop = el.scrollTop + Math.floor(el.clientHeight * 0.9);
             }
             """
         )
@@ -211,48 +254,32 @@ def scroll_modal_list(modal_locator: Any) -> bool:
         return False
 
 
-def click_store_card(
-    page: Any, expected_label: str, modal_locator: Optional[Any]
-) -> bool:
-    escaped_label = re.escape(expected_label)
-    exact_regex = re.compile(rf"^{escaped_label}$", re.IGNORECASE)
+def find_visible_store_card(
+    modal_locator: Any, expected_label: Optional[str], store_query: str
+) -> Tuple[Optional[Any], Optional[str]]:
+    expected_norm = normalize_string(expected_label) if expected_label else ""
+    query_norm = normalize_string(store_query)
 
-    def try_click() -> bool:
-        candidate = page.get_by_role("button", name=exact_regex)
-        if click_if_visible(candidate):
-            return True
-        candidate = page.get_by_role("link", name=exact_regex)
-        if click_if_visible(candidate):
-            return True
-        text_locator = page.get_by_text(expected_label, exact=True)
-        if text_locator.count():
-            for idx in range(text_locator.count()):
-                candidate = text_locator.nth(idx)
-                clickable = candidate.locator(
-                    "xpath=ancestor-or-self::button | "
-                    "ancestor-or-self::a | ancestor-or-self::*[@role='button']"
-                ).first
-                if click_if_visible(clickable):
-                    return True
-                if click_if_visible(candidate):
-                    return True
-        for selector in ("button", "[role='button']", "a"):
-            candidates = page.locator(selector, has_text=expected_label)
-            if click_if_visible(candidates):
-                return True
-        return False
-
-    if try_click():
-        return True
-
-    for _ in range(5):
-        if modal_locator and modal_locator.count():
-            if not scroll_modal_list(modal_locator):
-                break
-            page.wait_for_timeout(300)
-        if try_click():
-            return True
-    return False
+    card_texts = modal_locator.locator("text=/IKEA\\s+/i")
+    card_blocks = card_texts.locator(
+        "xpath=ancestor-or-self::*[self::button or self::a or "
+        "@role='button' or self::div][1]"
+    )
+    count = min(card_blocks.count(), 40)
+    for idx in range(count):
+        candidate = card_blocks.nth(idx)
+        try:
+            if not candidate.is_visible():
+                continue
+            text = candidate.inner_text()
+        except Exception:
+            continue
+        normalized = normalize_string(text)
+        if expected_norm and expected_norm in normalized:
+            return candidate, "expected"
+        if query_norm and query_norm in normalized:
+            return candidate, "query"
+    return None, None
 
 
 def capture_store_debug(
@@ -421,10 +448,6 @@ def set_store(
     page.goto("https://www.ikea.com/ca/fr/", wait_until="domcontentloaded")
     dismiss_consent(page)
     try:
-        if not expected_label:
-            raise RuntimeError(
-                "Libellé de magasin attendu manquant pour la sélection."
-            )
         target_label = expected_label
         print(
             "[store] Demande changement magasin: "
@@ -435,144 +458,83 @@ def set_store(
 
         open_store_modal(page)
         modal_locator = get_store_modal(page)
+        if not modal_locator or not modal_locator.count():
+            print("[store] WARNING: modal magasin introuvable.")
+            return
+
         click_select_another_store(page)
+        modal_locator.wait_for(state="visible", timeout=15000)
 
-        print(f"[store] Searching card by expected label: {target_label}")
-        selection_made = click_store_card(page, target_label, modal_locator)
+        scroll_container_handle = find_scroll_container(modal_locator)
+        if scroll_container_handle:
+            print("[store] Scroll container détecté dans le modal.")
+        else:
+            print("[store] WARNING: conteneur scroll introuvable, fallback modal.")
 
-        if not selection_made:
-            search_key = re.sub(
-                r"^IKEA\s+", "", target_label, flags=re.IGNORECASE
-            ).strip()
-            if not search_key:
-                search_key = target_label
-            print(f"[store] Search fallback in modal: typing '{search_key}'")
-            search_locators = []
-            if modal_locator and modal_locator.count():
-                search_locators.extend(
-                    [
-                        modal_locator.get_by_placeholder(
-                            "Recherche par emplacement"
-                        ),
-                        modal_locator.get_by_placeholder("Search by location"),
-                        modal_locator.get_by_label("Recherche par emplacement"),
-                        modal_locator.get_by_label("Search by location"),
-                        modal_locator.get_by_role("textbox"),
-                    ]
-                )
-            else:
-                search_locators.extend(
-                    [
-                        page.get_by_placeholder("Recherche par emplacement"),
-                        page.get_by_placeholder("Search by location"),
-                        page.get_by_label("Recherche par emplacement"),
-                        page.get_by_label("Search by location"),
-                        page.get_by_role("textbox"),
-                    ]
-                )
-            typed = False
-            for locator in search_locators:
-                if click_if_visible(locator, timeout=1000):
-                    try:
-                        locator.fill(search_key)
-                        typed = True
-                        break
-                    except Exception:
-                        continue
-            if typed:
-                try:
-                    page.get_by_text(target_label).first.wait_for(
-                        timeout=8000
-                    )
-                except Exception:
-                    pass
-                selection_made = click_store_card(
-                    page, target_label, modal_locator
-                )
-
-        if not selection_made:
-            raise RuntimeError(
-                "Magasin introuvable pour le libellé attendu: "
-                f"{target_label}"
+        found = None
+        match_type = None
+        for iteration in range(1, 41):
+            found, match_type = find_visible_store_card(
+                modal_locator, target_label, store_query
             )
+            if found:
+                snippet = (extract_text(found) or "")[:80]
+                print(
+                    "[store] Found store card "
+                    f"(iter={iteration}, match={match_type}): {snippet!r}"
+                )
+                try:
+                    found.click(timeout=8000)
+                except Exception:
+                    click_target = found.locator("xpath=.//button|.//a").first
+                    click_target.click(timeout=8000)
+                break
+            print(f"[store] Scroll iter {iteration}: store not visible yet.")
+            if scroll_container_handle:
+                if not scroll_container(scroll_container_handle):
+                    print("[store] WARNING: scroll container failed.")
+            else:
+                page.mouse.wheel(0, 1200)
+            page.wait_for_timeout(350)
 
-        confirm_selectors = [
-            "button:has-text('Confirmer')",
-            "button:has-text('Enregistrer')",
-            "button:has-text('Continuer')",
-            "button:has-text('Save')",
-            "button:has-text('Continue')",
-        ]
-        click_first_visible(page, confirm_selectors)
-        page.wait_for_timeout(500)
-        if modal_locator and modal_locator.count():
+        if not found:
+            print(
+                "[store] WARNING: store not found. "
+                f"query={store_query!r} expected={target_label!r}. "
+                "Continue without store switch."
+            )
             try:
-                modal_locator.wait_for(state="hidden", timeout=5000)
+                page.keyboard.press("Escape")
             except Exception:
                 pass
+            return
+
+        try:
+            modal_locator.wait_for(state="hidden", timeout=15000)
+        except Exception:
+            pass
         page.wait_for_load_state("networkidle", timeout=15000)
 
-        header_after = ""
-        header_changed = False
-        wait_deadline = time.time() + 12
-        while time.time() < wait_deadline:
-            header_after = extract_text(page.locator("header").first) or ""
-            header_changed = bool(header_after) and header_after != header_before
-            if header_changed or not store_modal_is_open(page):
-                break
-            page.wait_for_timeout(300)
-        print(f"[store] Header après changement: {header_after}")
-
-        in_stock_locator = page.locator(
-            f"text=/En stock\\s*:\\s*{re.escape(target_label)}/i"
-        )
-        in_stock_en_locator = page.locator(
-            f"text=/In stock\\s*:\\s*{re.escape(target_label)}/i"
-        )
-        header_button_match = False
-        header_locator = page.locator("header")
-        header_button = header_locator.get_by_role(
-            "button", name=re.compile(re.escape(target_label), re.IGNORECASE)
-        )
-        header_link = header_locator.get_by_role(
-            "link", name=re.compile(re.escape(target_label), re.IGNORECASE)
-        )
-        for locator in (header_button, header_link):
-            if not locator.count():
-                continue
-            for idx in range(locator.count()):
-                candidate = locator.nth(idx)
-                try:
-                    if candidate.is_visible():
-                        header_button_match = True
-                        break
-                except Exception:
-                    continue
-            if header_button_match:
-                break
-        if in_stock_locator.count() or in_stock_en_locator.count():
-            print(f"[store] OK store confirmed: {target_label}")
-            return
-        if re.search(re.escape(target_label), header_after, flags=re.IGNORECASE):
-            print(f"[store] OK store confirmed: {target_label}")
-            return
-        if header_button_match:
-            print(f"[store] OK store confirmed: {target_label}")
-            return
-        if not header_changed and store_modal_is_open(page):
-            capture_store_modal_html(modal_locator)
-            raise RuntimeError(
-                "Le magasin attendu n'a pas été appliqué après changement: "
-                f"{target_label}"
-            )
-        capture_store_modal_html(modal_locator)
-        raise RuntimeError(
-            "Le magasin attendu n'a pas été appliqué après changement: "
-            f"{target_label}"
-        )
+        if target_label:
+            try:
+                header_match = page.get_by_text(
+                    re.compile(re.escape(target_label), re.IGNORECASE)
+                ).first
+                header_match.wait_for(timeout=15000)
+                print(f"[store] OK store confirmed: {target_label}")
+                return
+            except Exception:
+                print(
+                    "[store] WARNING: store clicked but header confirmation "
+                    "not detected (continuing)."
+                )
+                return
     except Exception as exc:
         capture_store_debug(page, exc, store_query, expected_label)
-        raise
+        print(
+            "[store] WARNING: store selection failed, continue without switch."
+        )
+        return
 
 
 def find_show_more(page: Any) -> Optional[Any]:
