@@ -39,6 +39,7 @@ STORE_DEBUG_SCREENSHOT = "store_debug.png"
 STORE_DEBUG_HTML = "store_debug.html"
 STORE_DEBUG_TEXT = "store_debug.txt"
 STORE_HEADER_CONTROLS = "store_header_controls.txt"
+STORE_MODAL_DEBUG_HTML = "store_modal_debug.html"
 DEFAULT_HEADERS = {
     "User-Agent": DEFAULT_USER_AGENT,
     "Accept": "application/json",
@@ -318,6 +319,18 @@ def capture_store_header_controls(page: Any) -> None:
         pass
 
 
+def capture_store_modal_html(modal_locator: Optional[Any]) -> None:
+    if not modal_locator or not modal_locator.count():
+        return
+    try:
+        modal_html = modal_locator.inner_html()
+        Path(STORE_MODAL_DEBUG_HTML).write_text(
+            modal_html, encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
 def open_store_modal(page: Any) -> None:
     def attempt_click(locator: Any, method: str) -> bool:
         if not locator.count():
@@ -408,7 +421,11 @@ def set_store(
     page.goto("https://www.ikea.com/ca/fr/", wait_until="domcontentloaded")
     dismiss_consent(page)
     try:
-        target_label = expected_label or store_query
+        if not expected_label:
+            raise RuntimeError(
+                "Libellé de magasin attendu manquant pour la sélection."
+            )
+        target_label = expected_label
         print(
             "[store] Demande changement magasin: "
             f"store_query='{store_query}', expected='{target_label}'"
@@ -420,12 +437,63 @@ def set_store(
         modal_locator = get_store_modal(page)
         click_select_another_store(page)
 
-        print(f"[store] Click card: {target_label}")
+        print(f"[store] Searching card by expected label: {target_label}")
         selection_made = click_store_card(page, target_label, modal_locator)
 
         if not selection_made:
+            search_key = re.sub(
+                r"^IKEA\s+", "", target_label, flags=re.IGNORECASE
+            ).strip()
+            if not search_key:
+                search_key = target_label
+            print(f"[store] Search fallback in modal: typing '{search_key}'")
+            search_locators = []
+            if modal_locator and modal_locator.count():
+                search_locators.extend(
+                    [
+                        modal_locator.get_by_placeholder(
+                            "Recherche par emplacement"
+                        ),
+                        modal_locator.get_by_placeholder("Search by location"),
+                        modal_locator.get_by_label("Recherche par emplacement"),
+                        modal_locator.get_by_label("Search by location"),
+                        modal_locator.get_by_role("textbox"),
+                    ]
+                )
+            else:
+                search_locators.extend(
+                    [
+                        page.get_by_placeholder("Recherche par emplacement"),
+                        page.get_by_placeholder("Search by location"),
+                        page.get_by_label("Recherche par emplacement"),
+                        page.get_by_label("Search by location"),
+                        page.get_by_role("textbox"),
+                    ]
+                )
+            typed = False
+            for locator in search_locators:
+                if click_if_visible(locator, timeout=1000):
+                    try:
+                        locator.fill(search_key)
+                        typed = True
+                        break
+                    except Exception:
+                        continue
+            if typed:
+                try:
+                    page.get_by_text(target_label).first.wait_for(
+                        timeout=8000
+                    )
+                except Exception:
+                    pass
+                selection_made = click_store_card(
+                    page, target_label, modal_locator
+                )
+
+        if not selection_made:
             raise RuntimeError(
-                f"Magasin introuvable pour la requête: {store_query}"
+                "Magasin introuvable pour le libellé attendu: "
+                f"{target_label}"
             )
 
         confirm_selectors = [
@@ -444,30 +512,63 @@ def set_store(
                 pass
         page.wait_for_load_state("networkidle", timeout=15000)
 
-        header_after = extract_text(page.locator("header").first) or ""
+        header_after = ""
+        header_changed = False
+        wait_deadline = time.time() + 12
+        while time.time() < wait_deadline:
+            header_after = extract_text(page.locator("header").first) or ""
+            header_changed = bool(header_after) and header_after != header_before
+            if header_changed or not store_modal_is_open(page):
+                break
+            page.wait_for_timeout(300)
         print(f"[store] Header après changement: {header_after}")
-        header_changed = bool(header_after) and header_after != header_before
-
-        if expected_label and re.search(
-            re.escape(expected_label), header_after, flags=re.IGNORECASE
-        ):
-            print(f"[store] OK: header matches {expected_label}")
-            return
-
-        if not header_changed:
-            raise RuntimeError(
-                "Le header n'a pas changé après sélection du magasin."
-            )
 
         in_stock_locator = page.locator(
             f"text=/En stock\\s*:\\s*{re.escape(target_label)}/i"
         )
-        if in_stock_locator.count():
-            print(f"[store] OK: inStockStore = {target_label}")
+        in_stock_en_locator = page.locator(
+            f"text=/In stock\\s*:\\s*{re.escape(target_label)}/i"
+        )
+        header_button_match = False
+        header_locator = page.locator("header")
+        header_button = header_locator.get_by_role(
+            "button", name=re.compile(re.escape(target_label), re.IGNORECASE)
+        )
+        header_link = header_locator.get_by_role(
+            "link", name=re.compile(re.escape(target_label), re.IGNORECASE)
+        )
+        for locator in (header_button, header_link):
+            if not locator.count():
+                continue
+            for idx in range(locator.count()):
+                candidate = locator.nth(idx)
+                try:
+                    if candidate.is_visible():
+                        header_button_match = True
+                        break
+                except Exception:
+                    continue
+            if header_button_match:
+                break
+        if in_stock_locator.count() or in_stock_en_locator.count():
+            print(f"[store] OK store confirmed: {target_label}")
             return
-
+        if re.search(re.escape(target_label), header_after, flags=re.IGNORECASE):
+            print(f"[store] OK store confirmed: {target_label}")
+            return
+        if header_button_match:
+            print(f"[store] OK store confirmed: {target_label}")
+            return
+        if not header_changed and store_modal_is_open(page):
+            capture_store_modal_html(modal_locator)
+            raise RuntimeError(
+                "Le magasin attendu n'a pas été appliqué après changement: "
+                f"{target_label}"
+            )
+        capture_store_modal_html(modal_locator)
         raise RuntimeError(
-            "Le magasin attendu n'a pas été appliqué après changement."
+            "Le magasin attendu n'a pas été appliqué après changement: "
+            f"{target_label}"
         )
     except Exception as exc:
         capture_store_debug(page, exc, store_query, expected_label)
