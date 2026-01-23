@@ -18,6 +18,10 @@ from urllib.request import Request, urlopen
 
 
 DEFAULT_URL = "https://www.ikea.com/ca/fr/cat/last-chance/"
+FILTERED_LAST_CHANCE_URL = (
+    "https://www.ikea.com/ca/fr/cat/last-chance/"
+    "?filters=f_availability%3AAVAILABLE_IN_STORE"
+)
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -38,6 +42,9 @@ DEFAULT_HEADERS = {
     "Referer": DEFAULT_URL,
     "Origin": "https://www.ikea.com",
 }
+STORE_VALIDATION_SAMPLE_SIZE = 30
+STORE_VALIDATION_MIN_MATCHES = 5
+MAX_PAGINATION_PAGES = 200
 
 
 def should_use_headed(flag: bool) -> bool:
@@ -66,6 +73,101 @@ def dismiss_consent(page: Any) -> None:
                     locator.first.click(timeout=1500)
             except Exception:
                 continue
+
+
+def click_first_visible(
+    page: Any, selectors: List[str], timeout: int = 5000
+) -> bool:
+    for selector in selectors:
+        locator = page.locator(selector)
+        if not locator.count():
+            continue
+        for idx in range(locator.count()):
+            candidate = locator.nth(idx)
+            try:
+                if candidate.is_visible():
+                    candidate.click(timeout=timeout)
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def open_store_modal(page: Any) -> None:
+    selectors = [
+        "button:has-text('Magasin')",
+        "button:has-text('Store')",
+        "a:has-text('Magasin')",
+        "a:has-text('Store')",
+        "[data-testid*='store']",
+        "[aria-label*='Magasin']",
+        "[aria-label*='Store']",
+    ]
+    if not click_first_visible(page, selectors):
+        raise RuntimeError("Impossible d'ouvrir le modal Magasin/Store.")
+
+
+def set_store(
+    page: Any, store_query: str, expected_label: Optional[str]
+) -> None:
+    page.goto("https://www.ikea.com/ca/fr/", wait_until="domcontentloaded")
+    dismiss_consent(page)
+    open_store_modal(page)
+
+    input_selectors = [
+        "input[type='search']",
+        "input[placeholder*='Rechercher']",
+        "input[aria-label*='Rechercher']",
+        "input[placeholder*='Search']",
+        "input[aria-label*='Search']",
+    ]
+    search_input = None
+    for selector in input_selectors:
+        locator = page.locator(selector).first
+        if locator.count():
+            search_input = locator
+            break
+    if not search_input:
+        raise RuntimeError("Champ de recherche du magasin introuvable.")
+
+    search_input.fill(store_query)
+    page.wait_for_timeout(750)
+
+    target_label = expected_label or store_query
+    escaped_label = re.escape(target_label)
+    label_locator = page.locator(f"text=/{escaped_label}/i").first
+    if label_locator.count():
+        choose_button = label_locator.locator(
+            "button:has-text('Choisir'), "
+            "button:has-text('Sélectionner'), "
+            "button:has-text('Select'), "
+            "button:has-text('Confirmer'), "
+            "button:has-text('Enregistrer')"
+        )
+        if choose_button.count():
+            choose_button.first.click()
+        else:
+            label_locator.click()
+    else:
+        fallback_selectors = [
+            "button:has-text('Choisir')",
+            "button:has-text('Sélectionner')",
+            "button:has-text('Select')",
+        ]
+        if not click_first_visible(page, fallback_selectors):
+            raise RuntimeError(
+                f"Magasin introuvable pour la requête: {store_query}"
+            )
+
+    confirm_selectors = [
+        "button:has-text('Confirmer')",
+        "button:has-text('Enregistrer')",
+        "button:has-text('Continuer')",
+        "button:has-text('Save')",
+        "button:has-text('Continue')",
+    ]
+    click_first_visible(page, confirm_selectors)
+    page.wait_for_timeout(500)
 
 
 def find_show_more(page: Any) -> Optional[Any]:
@@ -220,7 +322,7 @@ def extract_product_from_card(card: Any) -> Dict[str, Optional[str]]:
 
 
 def collect_products_across_pages(page: Any) -> List[Dict[str, Any]]:
-    max_pages = 50
+    max_pages = MAX_PAGINATION_PAGES
     pages = 0
     seen_pages: set[str] = set()
     products_map: Dict[str, Dict[str, Any]] = {}
@@ -644,6 +746,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Nom du paramètre de query pour le storeId.",
     )
     parser.add_argument(
+        "--store-query",
+        help="Requête de recherche pour sélectionner le magasin.",
+    )
+    parser.add_argument(
         "--expected-store-label",
         help=(
             "Libellé exact du magasin attendu dans les cartes "
@@ -864,11 +970,113 @@ def validate_store_sample(
     return result
 
 
+def validate_store_on_page(
+    page: Any,
+    expected_store_label: str,
+    sample_size: int = STORE_VALIDATION_SAMPLE_SIZE,
+    min_matches: int = STORE_VALIDATION_MIN_MATCHES,
+) -> Dict[str, int]:
+    normalized_expected = normalize_store_label(expected_store_label)
+    cards = page.locator("div.plp-product-list__products > *")
+    checked = 0
+    matched = 0
+    card_count = min(cards.count(), sample_size)
+    for idx in range(card_count):
+        card = cards.nth(idx)
+        in_stock_store = extract_in_stock_store(card)
+        if (
+            in_stock_store
+            and normalize_store_label(in_stock_store) == normalized_expected
+        ):
+            matched += 1
+        checked += 1
+    result = {"checked": checked, "matched": matched}
+    if matched < min_matches:
+        raise RuntimeError(
+            "Validation du magasin échouée: "
+            f"{matched}/{checked} cartes correspondent à "
+            f"{expected_store_label}."
+        )
+    return result
+
+
+def scrape_store_products(
+    store_query: str,
+    expected_store_label: str,
+    headed: bool,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser, context = create_context(playwright, headed=headed)
+        page = context.new_page()
+        set_store(page, store_query, expected_store_label)
+        page.goto(FILTERED_LAST_CHANCE_URL, wait_until="domcontentloaded")
+        dismiss_consent(page)
+        page.wait_for_selector(
+            "div.plp-product-list__products > *", timeout=45000
+        )
+
+        store_match_sample = validate_store_on_page(
+            page, expected_store_label
+        )
+        products = collect_products_across_pages(page)
+
+        print(
+            "Total unique product urls = {count}".format(
+                count=len(products)
+            )
+        )
+
+        context.close()
+        browser.close()
+
+    return products, store_match_sample
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     headed = should_use_headed(args.headed)
     locations = parse_locations(args)
     store_ids = load_store_ids(args.store_ids)
+
+    if args.store_query:
+        if not args.expected_store_label or not args.store_slug:
+            print(
+                "Erreur: --store-query requiert --expected-store-label "
+                "et --store-slug.",
+                file=sys.stderr,
+            )
+            return 2
+        output_path = (
+            Path(args.out_base) / args.store_slug / "data.json"
+        )
+        products, store_match_sample = scrape_store_products(
+            args.store_query,
+            args.expected_store_label,
+            headed=headed,
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output = {
+            "source": FILTERED_LAST_CHANCE_URL,
+            "count": len(products),
+            "products": products,
+            "expectedStore": args.expected_store_label,
+            "storeMatchSample": store_match_sample,
+            "store": {
+                "query": args.store_query,
+                "slug": args.store_slug,
+            },
+        }
+        with output_path.open("w", encoding="utf-8") as handle:
+            json.dump(output, handle, ensure_ascii=False, indent=2)
+        print(
+            "{count} produits enregistrés dans {output}.".format(
+                count=len(products),
+                output=output_path,
+            )
+        )
+        return 0
 
     if not locations:
         expected_store = args.expected_store_label
