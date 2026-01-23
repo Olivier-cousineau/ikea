@@ -94,45 +94,85 @@ def count_products(page: Any) -> int:
     return page.locator("a[href*='/p/']").count()
 
 
-def load_more_until_done(page: Any) -> None:
+def normalize_page_url(url: str) -> str:
+    split_url = urlsplit(url)
+    filtered_query = [
+        (key, value)
+        for key, value in parse_qsl(split_url.query, keep_blank_values=True)
+        if key.lower() == "page"
+    ]
+    normalized_query = urlencode(filtered_query, doseq=True)
+    return urlunsplit(
+        split_url._replace(query=normalized_query, fragment="")
+    )
+
+
+def collect_product_links_across_pages(page: Any) -> List[str]:
     max_pages = 50
     pages = 0
+    seen_pages: set[str] = set()
+    seen_links: set[str] = set()
+    ordered_links: List[str] = []
+
     while pages < max_pages:
-        current_count = count_products(page)
+        normalized_current = normalize_page_url(page.url)
+        if normalized_current in seen_pages:
+            print(
+                "Pagination stop: page repeat detected -> {page}".format(
+                    page=normalized_current
+                )
+            )
+            break
+        seen_pages.add(normalized_current)
+
+        link_locator = page.locator("a[href*='/p/']")
+        link_count = link_locator.count()
+        for idx in range(link_count):
+            href = link_locator.nth(idx).get_attribute("href") or ""
+            if not href:
+                continue
+            if not href.startswith("http"):
+                href = f"https://www.ikea.com{href}"
+            if href in seen_links:
+                continue
+            seen_links.add(href)
+            ordered_links.append(href)
+
         more = page.locator('a[aria-label="Afficher plus de produits"]')
         link = more.first if more.count() else find_show_more(page)
         if not link:
-            print("Load more: no link found.")
+            print("Pagination stop: no show more link found.")
             break
         try:
             href = link.get_attribute("href")
         except Exception:
             href = None
         if not href:
-            print("Load more: empty href.")
+            print("Pagination stop: empty href.")
             break
         next_url = urljoin(page.url, href)
+        normalized_next = normalize_page_url(next_url)
+        if normalized_next in seen_pages:
+            print(
+                "Pagination stop: next page already seen -> {page}".format(
+                    page=normalized_next
+                )
+            )
+            break
         print(
-            "Load more: [PAGE]={page} [NEXT]={next} [NAV]=goto".format(
+            "Pagination: [PAGE]={page} [NEXT]={next} [NAV]=goto".format(
                 page=page.url, next=next_url
             )
         )
-        if next_url == page.url:
-            break
         page.goto(next_url, wait_until="domcontentloaded")
         dismiss_consent(page)
         try:
             page.wait_for_selector("a[href*='/p/']", timeout=10000)
         except Exception:
             pass
-        updated_count = count_products(page)
-        print("Load more: before={before} after={after}".format(
-            before=current_count,
-            after=updated_count,
-        ))
-        if updated_count == 0:
-            break
         pages += 1
+
+    return ordered_links
 
 
 def capture_api_request(page_url: str, headed: bool) -> Tuple[str, Dict[str, str]]:
@@ -199,7 +239,7 @@ def capture_api_request(page_url: str, headed: bool) -> Tuple[str, Dict[str, str
 
         page.wait_for_selector("a[href*='/p/']", timeout=45000)
 
-        load_more_until_done(page)
+        collect_product_links_across_pages(page)
 
         start_time = time.monotonic()
         timeout_seconds = 60
@@ -261,7 +301,7 @@ def scrape_products_from_page(
         page.goto(page_url, wait_until="domcontentloaded")
         dismiss_consent(page)
         page.wait_for_selector("a[href*='/p/']", timeout=45000)
-        load_more_until_done(page)
+        product_links = collect_product_links_across_pages(page)
 
         payloads: List[Any] = []
         next_data = page.evaluate("() => window.__NEXT_DATA__ || null")
@@ -284,54 +324,33 @@ def scrape_products_from_page(
             if items:
                 break
 
-        products: List[Dict[str, Any]] = []
+        products_map: Dict[str, Dict[str, Any]] = {}
         if items:
             for item in items:
-                products.append(build_product(item))
+                product = build_product(item)
+                if product.get("url"):
+                    products_map[product["url"]] = product
 
-        if not products:
-            link_locator = page.locator("a[href*='/p/']")
-            link_count = link_locator.count()
-            seen: set[str] = set()
-            for idx in range(link_count):
-                link = link_locator.nth(idx)
-                href = link.get_attribute("href") or ""
-                if not href:
-                    continue
-                if not href.startswith("http"):
-                    href = f"https://www.ikea.com{href}"
-                if href in seen:
-                    continue
-                seen.add(href)
-                try:
-                    text = link.inner_text().strip()
-                except Exception:
-                    text = ""
-                name = None
-                type_name = None
-                if text:
-                    lines = [line.strip() for line in text.splitlines() if line.strip()]
-                    if lines:
-                        name = lines[0]
-                    if len(lines) > 1:
-                        type_name = lines[1]
-                image = None
-                img_locator = link.locator("img").first
-                if img_locator.count():
-                    image = (
-                        img_locator.get_attribute("src")
-                        or img_locator.get_attribute("data-src")
-                        or img_locator.get_attribute("data-srcset")
-                    )
+        products: List[Dict[str, Any]] = []
+        for href in product_links:
+            if href in products_map:
+                products.append(products_map[href])
+            else:
                 products.append(
                     {
-                        "name": name,
-                        "typeName": type_name,
+                        "name": None,
+                        "typeName": None,
                         "price": None,
                         "url": href,
-                        "image": image,
+                        "image": None,
                     }
                 )
+
+        print(
+            "Total unique product urls = {count}".format(
+                count=len(product_links)
+            )
+        )
 
         context.close()
         browser.close()
