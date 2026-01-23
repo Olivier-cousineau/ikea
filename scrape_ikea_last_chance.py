@@ -101,7 +101,8 @@ def load_more_until_done(page: Any) -> None:
     while clicks < max_clicks:
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(1500)
-        button = find_show_more(page)
+        more = page.locator('a[aria-label="Afficher plus de produits"]')
+        button = more.first if more.count() else find_show_more(page)
         if not button:
             break
         try:
@@ -114,12 +115,24 @@ def load_more_until_done(page: Any) -> None:
                 button.click(timeout=8000)
             except Exception:
                 page.evaluate("(el) => el.click()", button)
-            page.wait_for_timeout(800)
             try:
-                page.wait_for_load_state("networkidle", timeout=10000)
+                page.wait_for_function(
+                    "(selector, before) => "
+                    "document.querySelectorAll(selector).length > before",
+                    ("a[href*='/p/']", current_count),
+                    timeout=10000,
+                )
             except Exception:
                 pass
             updated_count = count_products(page)
+            clicked_load_more = updated_count > current_count
+            print(
+                "Load more: before={before} after={after} clickedLoadMore={clicked}".format(
+                    before=current_count,
+                    after=updated_count,
+                    clicked=clicked_load_more,
+                )
+            )
             if updated_count <= last_count and updated_count <= current_count:
                 break
             last_count = updated_count
