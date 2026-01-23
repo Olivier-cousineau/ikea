@@ -35,6 +35,9 @@ DEBUG_HTML = "playwright_debug.html"
 DEBUG_REQUESTS = "playwright_debug_requests.txt"
 DEBUG_RESPONSES = "network_responses_filtered.json"
 DEBUG_LINKS = "playwright_debug_links.txt"
+STORE_DEBUG_SCREENSHOT = "store_debug.png"
+STORE_DEBUG_HTML = "store_debug.html"
+STORE_DEBUG_TEXT = "store_debug.txt"
 DEFAULT_HEADERS = {
     "User-Agent": DEFAULT_USER_AGENT,
     "Accept": "application/json",
@@ -45,6 +48,14 @@ DEFAULT_HEADERS = {
 STORE_VALIDATION_SAMPLE_SIZE = 30
 STORE_VALIDATION_MIN_MATCHES = 5
 MAX_PAGINATION_PAGES = 200
+STORE_SEARCH_SELECTORS = [
+    "input[type='search']",
+    "input[placeholder*='Rechercher']",
+    "input[aria-label*='Rechercher']",
+    "input[placeholder*='Search']",
+    "input[aria-label*='Search']",
+]
+STORE_MODAL_TITLE = "Choisir un magasin"
 
 
 def should_use_headed(flag: bool) -> bool:
@@ -93,17 +104,111 @@ def click_first_visible(
     return False
 
 
+def store_modal_is_open(page: Any) -> bool:
+    dialog = page.locator("[role=dialog]")
+    for idx in range(dialog.count()):
+        try:
+            if dialog.nth(idx).is_visible():
+                return True
+        except Exception:
+            continue
+    for selector in STORE_SEARCH_SELECTORS:
+        locator = page.locator(selector)
+        if locator.count():
+            try:
+                if locator.first.is_visible():
+                    return True
+            except Exception:
+                continue
+    title_locator = page.locator(f"text={STORE_MODAL_TITLE}")
+    if title_locator.count():
+        try:
+            if title_locator.first.is_visible():
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def capture_store_debug(
+    page: Any,
+    error: Exception,
+    store_query: Optional[str],
+    expected_label: Optional[str],
+) -> None:
+    try:
+        page.screenshot(path=STORE_DEBUG_SCREENSHOT, full_page=True)
+    except Exception:
+        pass
+    try:
+        html = page.content()
+        Path(STORE_DEBUG_HTML).write_text(html, encoding="utf-8")
+    except Exception:
+        pass
+    try:
+        details = [
+            f"Error: {error}",
+            f"URL: {page.url}",
+            f"Title: {page.title()}",
+            f"Store query: {store_query or ''}",
+            f"Expected label: {expected_label or ''}",
+            f"Modal visible: {store_modal_is_open(page)}",
+        ]
+        Path(STORE_DEBUG_TEXT).write_text(
+            "\n".join(details), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
 def open_store_modal(page: Any) -> None:
     selectors = [
         "button:has-text('Magasin')",
         "button:has-text('Store')",
         "a:has-text('Magasin')",
         "a:has-text('Store')",
+        "button:has-text('Choisir un magasin')",
+        "button:has-text('Choose a store')",
         "[data-testid*='store']",
         "[aria-label*='Magasin']",
         "[aria-label*='Store']",
     ]
-    if not click_first_visible(page, selectors):
+    header_selectors = [
+        "header button:has-text('Magasin')",
+        "header button:has-text('Store')",
+        "header a:has-text('Magasin')",
+        "header a:has-text('Store')",
+        "header [aria-label*='Magasin']",
+        "header [aria-label*='Store']",
+    ]
+
+    def attempt_open(selector: str, use_trial: bool) -> bool:
+        locator = page.locator(selector)
+        if not locator.count():
+            return False
+        for idx in range(locator.count()):
+            candidate = locator.nth(idx)
+            try:
+                if not candidate.is_visible():
+                    continue
+                if use_trial:
+                    candidate.click(trial=True, timeout=1500)
+                candidate.click(timeout=2000)
+                page.wait_for_timeout(500)
+                if store_modal_is_open(page):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    for selector in selectors:
+        if attempt_open(selector, use_trial=False):
+            return
+    for selector in header_selectors:
+        if attempt_open(selector, use_trial=True):
+            return
+
+    if not store_modal_is_open(page):
         raise RuntimeError("Impossible d'ouvrir le modal Magasin/Store.")
 
 
@@ -112,62 +217,59 @@ def set_store(
 ) -> None:
     page.goto("https://www.ikea.com/ca/fr/", wait_until="domcontentloaded")
     dismiss_consent(page)
-    open_store_modal(page)
+    try:
+        open_store_modal(page)
 
-    input_selectors = [
-        "input[type='search']",
-        "input[placeholder*='Rechercher']",
-        "input[aria-label*='Rechercher']",
-        "input[placeholder*='Search']",
-        "input[aria-label*='Search']",
-    ]
-    search_input = None
-    for selector in input_selectors:
-        locator = page.locator(selector).first
-        if locator.count():
-            search_input = locator
-            break
-    if not search_input:
-        raise RuntimeError("Champ de recherche du magasin introuvable.")
+        search_input = None
+        for selector in STORE_SEARCH_SELECTORS:
+            locator = page.locator(selector).first
+            if locator.count():
+                search_input = locator
+                break
+        if not search_input:
+            raise RuntimeError("Champ de recherche du magasin introuvable.")
 
-    search_input.fill(store_query)
-    page.wait_for_timeout(750)
+        search_input.fill(store_query)
+        page.wait_for_timeout(750)
 
-    target_label = expected_label or store_query
-    escaped_label = re.escape(target_label)
-    label_locator = page.locator(f"text=/{escaped_label}/i").first
-    if label_locator.count():
-        choose_button = label_locator.locator(
-            "button:has-text('Choisir'), "
-            "button:has-text('Sélectionner'), "
-            "button:has-text('Select'), "
-            "button:has-text('Confirmer'), "
-            "button:has-text('Enregistrer')"
-        )
-        if choose_button.count():
-            choose_button.first.click()
-        else:
-            label_locator.click()
-    else:
-        fallback_selectors = [
-            "button:has-text('Choisir')",
-            "button:has-text('Sélectionner')",
-            "button:has-text('Select')",
-        ]
-        if not click_first_visible(page, fallback_selectors):
-            raise RuntimeError(
-                f"Magasin introuvable pour la requête: {store_query}"
+        target_label = expected_label or store_query
+        escaped_label = re.escape(target_label)
+        label_locator = page.locator(f"text=/{escaped_label}/i").first
+        if label_locator.count():
+            choose_button = label_locator.locator(
+                "button:has-text('Choisir'), "
+                "button:has-text('Sélectionner'), "
+                "button:has-text('Select'), "
+                "button:has-text('Confirmer'), "
+                "button:has-text('Enregistrer')"
             )
+            if choose_button.count():
+                choose_button.first.click()
+            else:
+                label_locator.click()
+        else:
+            fallback_selectors = [
+                "button:has-text('Choisir')",
+                "button:has-text('Sélectionner')",
+                "button:has-text('Select')",
+            ]
+            if not click_first_visible(page, fallback_selectors):
+                raise RuntimeError(
+                    f"Magasin introuvable pour la requête: {store_query}"
+                )
 
-    confirm_selectors = [
-        "button:has-text('Confirmer')",
-        "button:has-text('Enregistrer')",
-        "button:has-text('Continuer')",
-        "button:has-text('Save')",
-        "button:has-text('Continue')",
-    ]
-    click_first_visible(page, confirm_selectors)
-    page.wait_for_timeout(500)
+        confirm_selectors = [
+            "button:has-text('Confirmer')",
+            "button:has-text('Enregistrer')",
+            "button:has-text('Continuer')",
+            "button:has-text('Save')",
+            "button:has-text('Continue')",
+        ]
+        click_first_visible(page, confirm_selectors)
+        page.wait_for_timeout(500)
+    except Exception as exc:
+        capture_store_debug(page, exc, store_query, expected_label)
+        raise
 
 
 def find_show_more(page: Any) -> Optional[Any]:
