@@ -108,6 +108,20 @@ def click_first_visible(
     return False
 
 
+def click_if_visible(locator: Any, timeout: int = 2000) -> bool:
+    if not locator.count():
+        return False
+    for idx in range(locator.count()):
+        candidate = locator.nth(idx)
+        try:
+            if candidate.is_visible():
+                candidate.click(timeout=timeout)
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def store_modal_is_open(page: Any) -> bool:
     dialog = page.locator("[role=dialog]")
     for idx in range(dialog.count()):
@@ -132,6 +146,25 @@ def store_modal_is_open(page: Any) -> bool:
                     return True
             except Exception:
                 continue
+    return False
+
+
+def click_select_another_store(page: Any) -> bool:
+    selectors = [
+        page.get_by_role("button", name="Sélectionner un autre magasin"),
+        page.get_by_role("button", name="Select another store"),
+        page.locator("button:has-text('Sélectionner un autre magasin')"),
+        page.locator("button:has-text('Select another store')"),
+        page.get_by_text("Sélectionner un autre magasin", exact=True),
+        page.get_by_text("Select another store", exact=True),
+    ]
+    for locator in selectors:
+        if click_if_visible(locator):
+            print(
+                "[store] Click: Select another store / "
+                "Sélectionner un autre magasin"
+            )
+            return True
     return False
 
 
@@ -185,37 +218,27 @@ def click_store_card(
 
     def try_click() -> bool:
         candidate = page.get_by_role("button", name=exact_regex)
-        if candidate.count():
-            candidate.first.click()
+        if click_if_visible(candidate):
             return True
         candidate = page.get_by_role("link", name=exact_regex)
-        if candidate.count():
-            candidate.first.click()
+        if click_if_visible(candidate):
             return True
-        text_locator = page.get_by_text(expected_label, exact=True).first
+        text_locator = page.get_by_text(expected_label, exact=True)
         if text_locator.count():
-            clickable = text_locator.locator(
-                "xpath=ancestor-or-self::button | "
-                "ancestor-or-self::a | ancestor-or-self::*[@role='button']"
-            ).first
-            if clickable.count():
-                clickable.click()
+            for idx in range(text_locator.count()):
+                candidate = text_locator.nth(idx)
+                clickable = candidate.locator(
+                    "xpath=ancestor-or-self::button | "
+                    "ancestor-or-self::a | ancestor-or-self::*[@role='button']"
+                ).first
+                if click_if_visible(clickable):
+                    return True
+                if click_if_visible(candidate):
+                    return True
+        for selector in ("button", "[role='button']", "a"):
+            candidates = page.locator(selector, has_text=expected_label)
+            if click_if_visible(candidates):
                 return True
-            text_locator.click()
-            return True
-        card_locator = page.locator(
-            f"div:has-text('{expected_label}')"
-        ).first
-        if card_locator.count():
-            clickable = card_locator.locator(
-                "xpath=ancestor-or-self::button | "
-                "ancestor-or-self::a | ancestor-or-self::*[@role='button']"
-            ).first
-            if clickable.count():
-                clickable.click()
-                return True
-            card_locator.click()
-            return True
         return False
 
     if try_click():
@@ -395,27 +418,10 @@ def set_store(
 
         open_store_modal(page)
         modal_locator = get_store_modal(page)
+        click_select_another_store(page)
 
-        search_input = None
-        for selector in STORE_SEARCH_SELECTORS:
-            locator = page.locator(selector).first
-            if locator.count():
-                search_input = locator
-                break
-        if search_input:
-            query = store_query or target_label
-            search_input.fill(query)
-            page.wait_for_timeout(750)
-        else:
-            print("[store] Aucun champ de recherche trouvé dans le modal.")
-
+        print(f"[store] Click card: {target_label}")
         selection_made = click_store_card(page, target_label, modal_locator)
-        if not selection_made and search_input:
-            search_input.fill("")
-            page.wait_for_timeout(500)
-            selection_made = click_store_card(
-                page, target_label, modal_locator
-            )
 
         if not selection_made:
             raise RuntimeError(
@@ -445,7 +451,7 @@ def set_store(
         if expected_label and re.search(
             re.escape(expected_label), header_after, flags=re.IGNORECASE
         ):
-            print("[store] Validation header: OK")
+            print(f"[store] OK: header matches {expected_label}")
             return
 
         if not header_changed:
@@ -457,7 +463,7 @@ def set_store(
             f"text=/En stock\\s*:\\s*{re.escape(target_label)}/i"
         )
         if in_stock_locator.count():
-            print("[store] Validation via En stock: OK")
+            print(f"[store] OK: inStockStore = {target_label}")
             return
 
         raise RuntimeError(
