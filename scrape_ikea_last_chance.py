@@ -614,6 +614,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Chemin du fichier JSON de sortie",
     )
     parser.add_argument(
+        "--out-base",
+        default="public/ikea",
+        help="Répertoire de base pour data.json par magasin.",
+    )
+    parser.add_argument(
         "--headed",
         action="store_true",
         help="Lance Playwright avec headless=False (ou HEADED=1).",
@@ -862,26 +867,43 @@ def validate_store_sample(
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     headed = should_use_headed(args.headed)
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
     locations = parse_locations(args)
     store_ids = load_store_ids(args.store_ids)
 
     if not locations:
-        products = scrape_url(args.url, headed)
-        expected_store = None
-        store_match_sample = None
-        if is_store_output_path(output_path):
-            if not args.expected_store_label:
-                raise RuntimeError(
-                    "expected-store-label requis pour valider "
-                    "les fichiers public/ikea/<store>/data.json."
+        expected_store = args.expected_store_label
+        if expected_store:
+            if not args.store_slug:
+                print(
+                    "Erreur: --store-slug est requis avec "
+                    "--expected-store-label.",
+                    file=sys.stderr,
                 )
-            expected_store = args.expected_store_label
+                return 2
+            output_path = (
+                Path(args.out_base) / args.store_slug / "data.json"
+            )
+            products = scrape_products_from_page(args.url, headed=headed)
             store_match_sample = validate_store_sample(
                 products, expected_store
             )
+        else:
+            output_path = Path(args.output)
+            if is_store_output_path(output_path):
+                print(
+                    "Erreur: --expected-store-label requis pour valider "
+                    "public/ikea/<store>/data.json.\n"
+                    "Exemple:\n"
+                    "python scrape_ikea_last_chance.py "
+                    "--expected-store-label \"IKEA Montréal\" "
+                    "--store-slug \"montreal-qc\" "
+                    "--out-base \"public/ikea\"",
+                    file=sys.stderr,
+                )
+                return 2
+            products = scrape_url(args.url, headed)
+            store_match_sample = None
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         store_payload = build_store_payload(args)
         output = {
             "source": args.url,
@@ -927,6 +949,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "locations": results,
     }
 
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as handle:
         json.dump(output, handle, ensure_ascii=False, indent=2)
 
