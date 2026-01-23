@@ -12,6 +12,48 @@ jobs:
           - label: "IKEA Montréal"
             query: "Montréal"
             slug: "montreal-qc"
+          - label: "IKEA Boucherville"
+            query: "Boucherville"
+            slug: "boucherville-qc"
+          - label: "IKEA Ottawa"
+            query: "Ottawa"
+            slug: "ottawa-on"
+          - label: "IKEA Québec"
+            query: "Québec"
+            slug: "quebec-qc"
+          - label: "IKEA North York"
+            query: "North York"
+            slug: "north-york-on"
+          - label: "IKEA Toronto Downtown"
+            query: "Toronto Downtown"
+            slug: "toronto-downtown-on"
+          - label: "IKEA Vaughan"
+            query: "Vaughan"
+            slug: "vaughan-on"
+          - label: "IKEA Etobicoke"
+            query: "Etobicoke"
+            slug: "etobicoke-on"
+          - label: "IKEA Burlington"
+            query: "Burlington"
+            slug: "burlington-on"
+          - label: "IKEA Halifax"
+            query: "Halifax"
+            slug: "halifax-ns"
+          - label: "IKEA Winnipeg"
+            query: "Winnipeg"
+            slug: "winnipeg-mb"
+          - label: "IKEA Edmonton"
+            query: "Edmonton"
+            slug: "edmonton-ab"
+          - label: "IKEA Calgary"
+            query: "Calgary"
+            slug: "calgary-ab"
+          - label: "IKEA Coquitlam"
+            query: "Coquitlam"
+            slug: "coquitlam-bc"
+          - label: "IKEA Richmond"
+            query: "Richmond"
+            slug: "richmond-bc"
     steps:
       - name: Checkout IKEA repo
         uses: actions/checkout@v4
@@ -37,37 +79,12 @@ jobs:
             --store-query "${{ matrix.store.query }}" \
             --out-base "public/ikea"
 
-      - name: Checkout econoplus repo
-        uses: actions/checkout@v4
-        with:
-          repository: Olivier-cousineau/econoplus
-          path: econoplus
-          token: ${{ secrets.ECONOPLUS }}
-
-      - name: Sync IKEA data to econoplus
-        run: |
-          mkdir -p econoplus/public/ikea
-          rsync -av --delete public/ikea/ econoplus/public/ikea/
-
-      - name: Commit and push results to econoplus
-        working-directory: econoplus
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "public/ikea"
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-            exit 0
-          fi
-          git commit -m "Update IKEA last chance data"
-          git push
-
       - name: Upload result
         uses: actions/upload-artifact@v4
         with:
-          name: ikea-last-chance
+          name: ikea-${{ matrix.store.slug }}
           path: |
-            public/ikea/*/data.json
+            public/ikea/${{ matrix.store.slug }}/data.json
             debug_ikea_last_chance.html
             debug_ikea_last_chance.png
 
@@ -82,3 +99,43 @@ jobs:
             store_debug.txt
             store_header_controls.txt
           if-no-files-found: ignore
+
+  publish_to_econoplus:
+    runs-on: ubuntu-latest
+    needs: scrape
+    steps:
+      - name: Checkout econoplus repo
+        uses: actions/checkout@v4
+        with:
+          repository: Olivier-cousineau/econoplus
+          path: econoplus
+          token: ${{ secrets.ECONOPLUS }}
+
+      - name: Download store artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: ikea-*
+          merge-multiple: true
+
+      - name: Copy store data into econoplus
+        run: |
+          find artifacts -name data.json -print0 | while IFS= read -r -d '' data_file; do
+            slug="$(basename "$(dirname "$data_file")")"
+            target_dir="econoplus/public/ikea/$slug"
+            mkdir -p "$target_dir"
+            cp "$data_file" "$target_dir/data.json"
+          done
+
+      - name: Commit and push results to econoplus
+        working-directory: econoplus
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "public/ikea"
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "Update IKEA last chance data"
+          git push
