@@ -196,51 +196,7 @@ def capture_store_header_controls(page: Any) -> None:
 
 
 def open_store_modal(page: Any) -> None:
-    selectors = [
-        "button:has-text('Magasin')",
-        "button:has-text('Magasins')",
-        "button:has-text('Store')",
-        "button:has-text('Stores')",
-        "a:has-text('Magasin')",
-        "a:has-text('Magasins')",
-        "a:has-text('Store')",
-        "a:has-text('Stores')",
-        "button:has-text('Choisir un magasin')",
-        "button:has-text('Sélectionner un magasin')",
-        "button:has-text('Choose a store')",
-        "button:has-text('Select a store')",
-        "[data-testid*='store' i]",
-        "[aria-label*='Magasin']",
-        "[aria-label*='Store']",
-        "[aria-label*='Choisir un magasin']",
-        "[aria-label*='Choose a store']",
-    ]
-    header_selectors = [
-        "header button:has-text('Magasin')",
-        "header button:has-text('Magasins')",
-        "header button:has-text('Store')",
-        "header button:has-text('Stores')",
-        "header a:has-text('Magasin')",
-        "header a:has-text('Magasins')",
-        "header a:has-text('Store')",
-        "header a:has-text('Stores')",
-        "header [aria-label*='Magasin']",
-        "header [aria-label*='Store']",
-        "header [aria-label*='Choisir un magasin']",
-        "header [aria-label*='Choose a store']",
-        "header [data-testid*='store' i]",
-    ]
-    keywords = (
-        "magasin",
-        "store",
-        "choisir un magasin",
-        "sélectionner un magasin",
-        "choose a store",
-        "select a store",
-    )
-
-    def attempt_open(selector: str, use_trial: bool) -> bool:
-        locator = page.locator(selector)
+    def attempt_click(locator: Any, method: str) -> bool:
         if not locator.count():
             return False
         for idx in range(locator.count()):
@@ -248,17 +204,16 @@ def open_store_modal(page: Any) -> None:
             try:
                 if not candidate.is_visible():
                     continue
-                if use_trial:
-                    candidate.click(trial=True, timeout=1500)
                 candidate.click(timeout=2000)
                 page.wait_for_timeout(500)
                 if store_modal_is_open(page):
+                    print(f"[store] Modal ouvert via: {method}")
                     return True
             except Exception:
                 continue
         return False
 
-    def attempt_open_from_header_controls() -> bool:
+    def attempt_header_current_store() -> bool:
         locator = page.locator("header button, header a")
         for idx in range(locator.count()):
             candidate = locator.nth(idx)
@@ -266,26 +221,55 @@ def open_store_modal(page: Any) -> None:
                 if not candidate.is_visible():
                     continue
                 text = extract_text(candidate) or ""
-                aria_label = candidate.get_attribute("aria-label") or ""
-                data_testid = candidate.get_attribute("data-testid") or ""
-                combined = " ".join([text, aria_label, data_testid]).lower()
-                if any(keyword in combined for keyword in keywords):
+                if re.search(r"\bIKEA\s+", text, flags=re.IGNORECASE):
                     candidate.click(timeout=2000)
                     page.wait_for_timeout(500)
                     if store_modal_is_open(page):
+                        print("[store] Modal ouvert via: header-current-store")
                         return True
             except Exception:
                 continue
         return False
 
+    def attempt_role_regex() -> bool:
+        regex = re.compile(r"^IKEA\s+", flags=re.IGNORECASE)
+        if attempt_click(page.get_by_role("button", name=regex), "role-button"):
+            return True
+        if attempt_click(page.get_by_role("link", name=regex), "role-link"):
+            return True
+        header = page.locator("header")
+        if attempt_click(
+            header.get_by_role("button", name=regex), "header-role-button"
+        ):
+            return True
+        if attempt_click(
+            header.get_by_role("link", name=regex), "header-role-link"
+        ):
+            return True
+        return False
+
     page.wait_for_timeout(500)
-    for selector in selectors:
-        if attempt_open(selector, use_trial=False):
-            return
-    for selector in header_selectors:
-        if attempt_open(selector, use_trial=True):
-            return
-    if attempt_open_from_header_controls():
+    if attempt_header_current_store():
+        return
+    if attempt_role_regex():
+        return
+    if attempt_click(
+        page.locator("button:has-text('Sélectionner un autre magasin')"),
+        "select-other-store-fr",
+    ):
+        return
+    if attempt_click(
+        page.locator("button:has-text('Select another store')"),
+        "select-other-store-en",
+    ):
+        return
+    if attempt_click(
+        page.locator(
+            "[aria-label*='store' i], [aria-label*='magasin' i], "
+            "[data-testid*='store' i], [data-testid*='magasin' i]"
+        ),
+        "aria-testid-fallback",
+    ):
         return
 
     if not store_modal_is_open(page):
@@ -301,6 +285,14 @@ def set_store(
     page.goto("https://www.ikea.com/ca/fr/", wait_until="domcontentloaded")
     dismiss_consent(page)
     try:
+        target_label = expected_label or store_query
+        print(
+            "[store] Demande changement magasin: "
+            f"store_query='{store_query}', expected='{target_label}'"
+        )
+        header_before = extract_text(page.locator("header").first) or ""
+        print(f"[store] Header avant changement: {header_before}")
+
         open_store_modal(page)
 
         search_input = None
@@ -309,37 +301,32 @@ def set_store(
             if locator.count():
                 search_input = locator
                 break
-        if not search_input:
-            raise RuntimeError("Champ de recherche du magasin introuvable.")
-
-        search_input.fill(store_query)
-        page.wait_for_timeout(750)
-
-        target_label = expected_label or store_query
-        escaped_label = re.escape(target_label)
-        label_locator = page.locator(f"text=/{escaped_label}/i").first
-        if label_locator.count():
-            choose_button = label_locator.locator(
-                "button:has-text('Choisir'), "
-                "button:has-text('Sélectionner'), "
-                "button:has-text('Select'), "
-                "button:has-text('Confirmer'), "
-                "button:has-text('Enregistrer')"
-            )
-            if choose_button.count():
-                choose_button.first.click()
-            else:
-                label_locator.click()
+        if search_input:
+            query = store_query or target_label
+            search_input.fill(query)
+            page.wait_for_timeout(750)
         else:
-            fallback_selectors = [
-                "button:has-text('Choisir')",
-                "button:has-text('Sélectionner')",
-                "button:has-text('Select')",
-            ]
-            if not click_first_visible(page, fallback_selectors):
-                raise RuntimeError(
-                    f"Magasin introuvable pour la requête: {store_query}"
-                )
+            print("[store] Aucun champ de recherche trouvé dans le modal.")
+
+        escaped_label = re.escape(target_label)
+        exact_regex = re.compile(rf"^{escaped_label}$", re.IGNORECASE)
+        selection_made = False
+        if page.get_by_role("button", name=exact_regex).count():
+            page.get_by_role("button", name=exact_regex).first.click()
+            selection_made = True
+        elif page.get_by_role("link", name=exact_regex).count():
+            page.get_by_role("link", name=exact_regex).first.click()
+            selection_made = True
+        else:
+            label_locator = page.locator(f"text=/{escaped_label}/i").first
+            if label_locator.count():
+                label_locator.click()
+                selection_made = True
+
+        if not selection_made:
+            raise RuntimeError(
+                f"Magasin introuvable pour la requête: {store_query}"
+            )
 
         confirm_selectors = [
             "button:has-text('Confirmer')",
@@ -350,6 +337,33 @@ def set_store(
         ]
         click_first_visible(page, confirm_selectors)
         page.wait_for_timeout(500)
+        page.wait_for_load_state("networkidle", timeout=15000)
+
+        header_after = extract_text(page.locator("header").first) or ""
+        print(f"[store] Header après changement: {header_after}")
+        header_changed = bool(header_after) and header_after != header_before
+
+        if expected_label and re.search(
+            re.escape(expected_label), header_after, flags=re.IGNORECASE
+        ):
+            print("[store] Validation header: OK")
+            return
+
+        if not header_changed:
+            raise RuntimeError(
+                "Le header n'a pas changé après sélection du magasin."
+            )
+
+        in_stock_locator = page.locator(
+            f"text=/En stock\\s*:\\s*{re.escape(target_label)}/i"
+        )
+        if in_stock_locator.count():
+            print("[store] Validation via En stock: OK")
+            return
+
+        raise RuntimeError(
+            "Le magasin attendu n'a pas été appliqué après changement."
+        )
     except Exception as exc:
         capture_store_debug(page, exc, store_query, expected_label)
         raise
