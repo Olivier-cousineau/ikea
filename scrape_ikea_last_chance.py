@@ -444,7 +444,7 @@ def open_store_modal(page: Any) -> None:
 
 def set_store(
     page: Any, store_query: str, expected_label: Optional[str]
-) -> None:
+) -> bool:
     page.goto("https://www.ikea.com/ca/fr/", wait_until="domcontentloaded")
     dismiss_consent(page)
     try:
@@ -457,45 +457,62 @@ def set_store(
         print(f"[store] Header avant changement: {header_before}")
 
         open_store_modal(page)
-        modal_locator = get_store_modal(page)
-        if not modal_locator or not modal_locator.count():
+        dialog = page.locator("div[role='dialog'].hnf-sheets").first
+        try:
+            dialog.wait_for(state="visible", timeout=15000)
+        except Exception:
+            dialog = get_store_modal(page)
+            if dialog:
+                dialog.wait_for(state="visible", timeout=15000)
+        if not dialog or not dialog.count():
             print("[store] WARNING: modal magasin introuvable.")
-            return
+            return False
 
         click_select_another_store(page)
-        modal_locator.wait_for(state="visible", timeout=15000)
+        dialog.wait_for(state="visible", timeout=15000)
 
-        scroll_container_handle = find_scroll_container(modal_locator)
-        if scroll_container_handle:
-            print("[store] Scroll container détecté dans le modal.")
-        else:
-            print("[store] WARNING: conteneur scroll introuvable, fallback modal.")
+        if not target_label:
+            print("[store] WARNING: expected store label missing.")
+            return False
 
-        found = None
-        match_type = None
-        for iteration in range(1, 41):
-            found, match_type = find_visible_store_card(
-                modal_locator, target_label, store_query
-            )
-            if found:
-                snippet = (extract_text(found) or "")[:80]
+        container = dialog.locator(
+            "div.hnf-sheets__content-wrapper"
+        ).first
+        container.wait_for(state="visible", timeout=15000)
+        print("[store] Scroll container prêt.")
+
+        title_locator = dialog.locator(
+            "span.hnf-choice-item__title",
+            has_text=target_label,
+        )
+        target_btn = dialog.locator(
+            "button.hnf-choice-item__action",
+            has=title_locator,
+        ).first
+
+        found = False
+        for iteration in range(1, 61):
+            if target_btn.count() and target_btn.is_visible():
                 print(
-                    "[store] Found store card "
-                    f"(iter={iteration}, match={match_type}): {snippet!r}"
+                    "[store] Store button visible "
+                    f"(iter={iteration})."
                 )
-                try:
-                    found.click(timeout=8000)
-                except Exception:
-                    click_target = found.locator("xpath=.//button|.//a").first
-                    click_target.click(timeout=8000)
+                target_btn.click(timeout=8000)
+                found = True
                 break
-            print(f"[store] Scroll iter {iteration}: store not visible yet.")
-            if scroll_container_handle:
-                if not scroll_container(scroll_container_handle):
-                    print("[store] WARNING: scroll container failed.")
-            else:
-                page.mouse.wheel(0, 1200)
-            page.wait_for_timeout(350)
+            try:
+                scroll_top = container.evaluate("el => el.scrollTop")
+            except Exception:
+                scroll_top = None
+            print(
+                "[store] Scroll iter {iter}: scrollTop={scroll_top}".format(
+                    iter=iteration, scroll_top=scroll_top
+                )
+            )
+            container.evaluate(
+                "el => { el.scrollTop += el.clientHeight * 0.85; }"
+            )
+            page.wait_for_timeout(300)
 
         if not found:
             print(
@@ -507,12 +524,26 @@ def set_store(
                 page.keyboard.press("Escape")
             except Exception:
                 pass
-            return
+            return False
 
         try:
-            modal_locator.wait_for(state="hidden", timeout=15000)
+            dialog.wait_for(state="hidden", timeout=15000)
         except Exception:
-            pass
+            if target_label:
+                try:
+                    page.wait_for_function(
+                        """
+                        (label) => {
+                          const header = document.querySelector('header');
+                          return header && header.textContent
+                            && header.textContent.includes(label);
+                        }
+                        """,
+                        target_label,
+                        timeout=15000,
+                    )
+                except Exception:
+                    pass
         page.wait_for_load_state("networkidle", timeout=15000)
 
         if target_label:
@@ -522,19 +553,20 @@ def set_store(
                 ).first
                 header_match.wait_for(timeout=15000)
                 print(f"[store] OK store confirmed: {target_label}")
-                return
+                return True
             except Exception:
                 print(
                     "[store] WARNING: store clicked but header confirmation "
                     "not detected (continuing)."
                 )
-                return
+                return True
     except Exception as exc:
         capture_store_debug(page, exc, store_query, expected_label)
         print(
             "[store] WARNING: store selection failed, continue without switch."
         )
-        return
+        return False
+    return False
 
 
 def find_show_more(page: Any) -> Optional[Any]:
@@ -1377,16 +1409,23 @@ def scrape_store_products(
     with sync_playwright() as playwright:
         browser, context = create_context(playwright, headed=headed)
         page = context.new_page()
-        set_store(page, store_query, expected_store_label)
+        store_set = set_store(page, store_query, expected_store_label)
         page.goto(FILTERED_LAST_CHANCE_URL, wait_until="domcontentloaded")
         dismiss_consent(page)
         page.wait_for_selector(
             "div.plp-product-list__products > *", timeout=45000
         )
 
-        store_match_sample = validate_store_on_page(
-            page, expected_store_label
-        )
+        store_match_sample: Dict[str, int]
+        if store_set:
+            store_match_sample = validate_store_on_page(
+                page, expected_store_label
+            )
+        else:
+            print(
+                "[store] WARNING: store not set, skip validate_store_on_page."
+            )
+            store_match_sample = {"checked": 0, "matched": 0}
         products = collect_products_across_pages(page)
 
         print(
