@@ -483,14 +483,18 @@ def update_query_params(
 def update_single_query_param(
     query_pairs: List[Tuple[str, str]],
     target_key: str,
-    target_value: int,
+    target_value: str,
 ) -> List[Tuple[str, str]]:
     updated: List[Tuple[str, str]] = []
+    found = False
     for key, value in query_pairs:
         if key == target_key:
             updated.append((key, str(target_value)))
+            found = True
         else:
             updated.append((key, value))
+    if not found:
+        updated.append((target_key, str(target_value)))
     return updated
 
 
@@ -575,18 +579,79 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Lance Playwright avec headless=False (ou HEADED=1).",
     )
+    parser.add_argument(
+        "--locations",
+        help="Liste de magasins (séparés par des virgules) à scraper.",
+    )
+    parser.add_argument(
+        "--locations-file",
+        help="Chemin d'un fichier contenant une liste de magasins (1 par ligne).",
+    )
+    parser.add_argument(
+        "--store-ids",
+        help=(
+            "Chemin d'un fichier JSON associant nom de magasin -> storeId "
+            "(ex: {\"IKEA Montréal\": \"123\"})."
+        ),
+    )
+    parser.add_argument(
+        "--store-param",
+        default="storeId",
+        help="Nom du paramètre de query pour le storeId.",
+    )
     return parser.parse_args(argv)
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    args = parse_args(argv)
-    headed = should_use_headed(args.headed)
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+def parse_locations(args: argparse.Namespace) -> List[str]:
+    locations: List[str] = []
+    if args.locations:
+        locations.extend(
+            [item.strip() for item in args.locations.split(",") if item.strip()]
+        )
+    if args.locations_file:
+        location_path = Path(args.locations_file)
+        for line in location_path.read_text(encoding="utf-8").splitlines():
+            cleaned = line.strip()
+            if cleaned and not cleaned.startswith("#"):
+                locations.append(cleaned)
+    unique_locations: List[str] = []
+    seen = set()
+    for location in locations:
+        if location not in seen:
+            unique_locations.append(location)
+            seen.add(location)
+    return unique_locations
 
+
+def load_store_ids(path: Optional[str]) -> Dict[str, str]:
+    if not path:
+        return {}
+    store_path = Path(path)
+    if not store_path.exists():
+        raise FileNotFoundError(f"Fichier store-ids introuvable: {path}")
+    data = json.loads(store_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("Le fichier store-ids doit contenir un objet JSON.")
+    return {
+        str(key): str(value)
+        for key, value in data.items()
+        if value is not None
+    }
+
+
+def build_location_url(base_url: str, store_id: Optional[str], param: str) -> str:
+    if not store_id:
+        return base_url
+    parsed_url = urlsplit(base_url)
+    query_pairs = parse_qsl(parsed_url.query, keep_blank_values=True)
+    updated = update_single_query_param(query_pairs, param, store_id)
+    return urlunsplit(parsed_url._replace(query=urlencode(updated, doseq=True)))
+
+
+def scrape_url(url: str, headed: bool) -> List[Dict[str, Any]]:
     if headed:
         try:
-            products = scrape_products_from_page(args.url, headed=True)
+            products = scrape_products_from_page(url, headed=True)
         except Exception as exc:
             print(
                 f"Erreur Playwright headed, fallback API: {exc}",
@@ -597,24 +662,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(
                 f"Total produits collectés via Playwright = {len(products)}"
             )
-            output = {
-                "source": args.url,
-                "count": len(products),
-                "products": products,
-            }
-            with output_path.open("w", encoding="utf-8") as handle:
-                json.dump(output, handle, ensure_ascii=False, indent=2)
-            print(
-                "{count} produits enregistrés dans {output}.".format(
-                    count=len(products),
-                    output=args.output,
-                )
-            )
-            return 0
+            return products
 
     try:
         api_url_template, captured_headers = capture_api_request(
-            args.url, headed=headed
+            url, headed=headed
         )
         use_api = True
     except Exception as exc:
@@ -684,22 +736,68 @@ def main(argv: Optional[List[str]] = None) -> int:
                 page += 1
 
         print(f"Total produits collectés = {len(products)}")
-    else:
-        products = scrape_products_from_page(args.url, headed=headed)
-        print(f"Total produits collectés via DOM = {len(products)}")
+        return products
+
+    products = scrape_products_from_page(url, headed=headed)
+    print(f"Total produits collectés via DOM = {len(products)}")
+    return products
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+    headed = should_use_headed(args.headed)
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    locations = parse_locations(args)
+    store_ids = load_store_ids(args.store_ids)
+
+    if not locations:
+        products = scrape_url(args.url, headed)
+        output = {
+            "source": args.url,
+            "count": len(products),
+            "products": products,
+        }
+        with output_path.open("w", encoding="utf-8") as handle:
+            json.dump(output, handle, ensure_ascii=False, indent=2)
+        print(
+            "{count} produits enregistrés dans {output}.".format(
+                count=len(products),
+                output=args.output,
+            )
+        )
+        return 0
+
+    results = []
+    for location in locations:
+        store_id = store_ids.get(location)
+        if not store_id:
+            print(
+                f"[WARN] Aucun storeId pour {location}. URL de base utilisée."
+            )
+        location_url = build_location_url(args.url, store_id, args.store_param)
+        products = scrape_url(location_url, headed)
+        results.append(
+            {
+                "location": location,
+                "source": location_url,
+                "count": len(products),
+                "products": products,
+            }
+        )
 
     output = {
         "source": args.url,
-        "count": len(products),
-        "products": products,
+        "locations": results,
     }
 
     with output_path.open("w", encoding="utf-8") as handle:
         json.dump(output, handle, ensure_ascii=False, indent=2)
 
     print(
-        "{count} produits enregistrés dans {output}.".format(
-            count=len(products),
+        "{count} emplacements enregistrés dans {output}.".format(
+            count=len(results),
             output=args.output,
         )
     )
