@@ -198,23 +198,46 @@ def capture_store_header_controls(page: Any) -> None:
 def open_store_modal(page: Any) -> None:
     selectors = [
         "button:has-text('Magasin')",
+        "button:has-text('Magasins')",
         "button:has-text('Store')",
+        "button:has-text('Stores')",
         "a:has-text('Magasin')",
+        "a:has-text('Magasins')",
         "a:has-text('Store')",
+        "a:has-text('Stores')",
         "button:has-text('Choisir un magasin')",
+        "button:has-text('Sélectionner un magasin')",
         "button:has-text('Choose a store')",
-        "[data-testid*='store']",
+        "button:has-text('Select a store')",
+        "[data-testid*='store' i]",
         "[aria-label*='Magasin']",
         "[aria-label*='Store']",
+        "[aria-label*='Choisir un magasin']",
+        "[aria-label*='Choose a store']",
     ]
     header_selectors = [
         "header button:has-text('Magasin')",
+        "header button:has-text('Magasins')",
         "header button:has-text('Store')",
+        "header button:has-text('Stores')",
         "header a:has-text('Magasin')",
+        "header a:has-text('Magasins')",
         "header a:has-text('Store')",
+        "header a:has-text('Stores')",
         "header [aria-label*='Magasin']",
         "header [aria-label*='Store']",
+        "header [aria-label*='Choisir un magasin']",
+        "header [aria-label*='Choose a store']",
+        "header [data-testid*='store' i]",
     ]
+    keywords = (
+        "magasin",
+        "store",
+        "choisir un magasin",
+        "sélectionner un magasin",
+        "choose a store",
+        "select a store",
+    )
 
     def attempt_open(selector: str, use_trial: bool) -> bool:
         locator = page.locator(selector)
@@ -235,12 +258,35 @@ def open_store_modal(page: Any) -> None:
                 continue
         return False
 
+    def attempt_open_from_header_controls() -> bool:
+        locator = page.locator("header button, header a")
+        for idx in range(locator.count()):
+            candidate = locator.nth(idx)
+            try:
+                if not candidate.is_visible():
+                    continue
+                text = extract_text(candidate) or ""
+                aria_label = candidate.get_attribute("aria-label") or ""
+                data_testid = candidate.get_attribute("data-testid") or ""
+                combined = " ".join([text, aria_label, data_testid]).lower()
+                if any(keyword in combined for keyword in keywords):
+                    candidate.click(timeout=2000)
+                    page.wait_for_timeout(500)
+                    if store_modal_is_open(page):
+                        return True
+            except Exception:
+                continue
+        return False
+
+    page.wait_for_timeout(500)
     for selector in selectors:
         if attempt_open(selector, use_trial=False):
             return
     for selector in header_selectors:
         if attempt_open(selector, use_trial=True):
             return
+    if attempt_open_from_header_controls():
+        return
 
     if not store_modal_is_open(page):
         error = RuntimeError("Impossible d'ouvrir le modal Magasin/Store.")
