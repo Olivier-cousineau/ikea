@@ -7,10 +7,8 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout IKEA repo
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.ECONOPLUS }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -25,22 +23,35 @@ jobs:
 
       - name: Run scraper
         run: |
-          rm -f "public/IKEA store.json"
-          mkdir -p public
+          rm -rf "public/ikea"
+          mkdir -p "public/ikea/last-chance"
           python scrape_ikea_last_chance.py \
             --url "https://www.ikea.com/ca/fr/cat/last-chance/?filters=f-availability%3AAVAILABLE_IN_STORE" \
-            --output "public/IKEA store.json"
+            --output "public/ikea/last-chance/data.json"
 
-      - name: Commit and push results
+      - name: Checkout econoplus repo
+        uses: actions/checkout@v4
+        with:
+          repository: Olivier-cousineau/econoplus
+          path: econoplus
+          token: ${{ secrets.ECONOPLUS }}
+
+      - name: Sync IKEA data to econoplus
+        run: |
+          mkdir -p econoplus/public/ikea
+          rsync -av --delete public/ikea/ econoplus/public/ikea/
+
+      - name: Commit and push results to econoplus
+        working-directory: econoplus
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "public/IKEA store.json"
+          git add "public/ikea"
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
-          git commit -m "Update IKEA store data"
+          git commit -m "Update IKEA last chance data"
           git push
 
       - name: Upload result
@@ -48,6 +59,6 @@ jobs:
         with:
           name: ikea-last-chance
           path: |
-            public/IKEA store.json
+            public/ikea/last-chance/data.json
             debug_ikea_last_chance.html
             debug_ikea_last_chance.png
