@@ -107,12 +107,71 @@ def normalize_page_url(url: str) -> str:
     )
 
 
-def collect_product_links_across_pages(page: Any) -> List[str]:
+def pick_image_source(img_locator: Any) -> Optional[str]:
+    for attr in ("src", "data-src", "srcset", "data-srcset"):
+        value = img_locator.get_attribute(attr)
+        if not value:
+            continue
+        if attr.endswith("srcset"):
+            first = value.split(",")[0].strip()
+            if first:
+                return first.split(" ")[0]
+        else:
+            return value
+    return None
+
+
+def extract_text(locator: Any) -> Optional[str]:
+    try:
+        text = locator.inner_text().strip()
+    except Exception:
+        return None
+    return text or None
+
+
+def pick_name_and_type(card: Any) -> Tuple[Optional[str], Optional[str]]:
+    candidates = [
+        card.locator("a[href*='/p/']").first,
+        card.locator("h3").first,
+        card.locator("h2").first,
+    ]
+    for candidate in candidates:
+        if not candidate.count():
+            continue
+        text = extract_text(candidate)
+        if text:
+            parts = [line.strip() for line in text.splitlines() if line.strip()]
+            if not parts:
+                continue
+            name = parts[0]
+            type_name = parts[1] if len(parts) > 1 else None
+            return name, type_name
+    return None, None
+
+
+def pick_price(card: Any) -> Optional[str]:
+    selectors = [
+        "[data-testid*='price']",
+        "[data-testid*='Price']",
+        "[data-testid*='product-price']",
+        "[aria-label*='$']",
+        "[aria-label*='CAD']",
+        "span:has-text('$')",
+    ]
+    for selector in selectors:
+        locator = card.locator(selector).first
+        if locator.count():
+            text = extract_text(locator)
+            if text:
+                return text
+    return None
+
+
+def collect_products_across_pages(page: Any) -> List[Dict[str, Any]]:
     max_pages = 50
     pages = 0
     seen_pages: set[str] = set()
-    seen_links: set[str] = set()
-    ordered_links: List[str] = []
+    products_map: Dict[str, Dict[str, Any]] = {}
 
     while pages < max_pages:
         normalized_current = normalize_page_url(page.url)
@@ -125,18 +184,43 @@ def collect_product_links_across_pages(page: Any) -> List[str]:
             break
         seen_pages.add(normalized_current)
 
-        link_locator = page.locator("a[href*='/p/']")
-        link_count = link_locator.count()
-        for idx in range(link_count):
-            href = link_locator.nth(idx).get_attribute("href") or ""
+        cards = page.locator("div.plp-product-list__products > *")
+        card_count = cards.count()
+        for idx in range(card_count):
+            card = cards.nth(idx)
+            link_locator = card.locator("a[href*='/p/']").first
+            if not link_locator.count():
+                continue
+            href = link_locator.get_attribute("href") or ""
             if not href:
                 continue
             if not href.startswith("http"):
                 href = f"https://www.ikea.com{href}"
-            if href in seen_links:
-                continue
-            seen_links.add(href)
-            ordered_links.append(href)
+            product = products_map.get(
+                href,
+                {
+                    "name": None,
+                    "typeName": None,
+                    "price": None,
+                    "url": href,
+                    "image": None,
+                },
+            )
+            image = None
+            img_locator = card.locator("img").first
+            if img_locator.count():
+                image = pick_image_source(img_locator)
+            name, type_name = pick_name_and_type(card)
+            price = pick_price(card)
+            if image and not product.get("image"):
+                product["image"] = image
+            if name and not product.get("name"):
+                product["name"] = name
+            if type_name and not product.get("typeName"):
+                product["typeName"] = type_name
+            if price and not product.get("price"):
+                product["price"] = price
+            products_map[href] = product
 
         more = page.locator('a[aria-label="Afficher plus de produits"]')
         link = more.first if more.count() else find_show_more(page)
@@ -172,7 +256,7 @@ def collect_product_links_across_pages(page: Any) -> List[str]:
             pass
         pages += 1
 
-    return ordered_links
+    return list(products_map.values())
 
 
 def capture_api_request(page_url: str, headed: bool) -> Tuple[str, Dict[str, str]]:
@@ -239,7 +323,7 @@ def capture_api_request(page_url: str, headed: bool) -> Tuple[str, Dict[str, str
 
         page.wait_for_selector("a[href*='/p/']", timeout=45000)
 
-        collect_product_links_across_pages(page)
+        collect_products_across_pages(page)
 
         start_time = time.monotonic()
         timeout_seconds = 60
@@ -300,55 +384,14 @@ def scrape_products_from_page(
         page = context.new_page()
         page.goto(page_url, wait_until="domcontentloaded")
         dismiss_consent(page)
-        page.wait_for_selector("a[href*='/p/']", timeout=45000)
-        product_links = collect_product_links_across_pages(page)
-
-        payloads: List[Any] = []
-        next_data = page.evaluate("() => window.__NEXT_DATA__ || null")
-        if next_data:
-            payloads.append(next_data)
-        nuxt_data = page.evaluate("() => window.__NUXT__ || null")
-        if nuxt_data:
-            payloads.append(nuxt_data)
-        for script in page.locator(
-            "script[type='application/ld+json']"
-        ).all_inner_texts():
-            try:
-                payloads.append(json.loads(script))
-            except json.JSONDecodeError:
-                continue
-
-        items: List[Dict[str, Any]] = []
-        for payload in payloads:
-            items = find_product_list(payload)
-            if items:
-                break
-
-        products_map: Dict[str, Dict[str, Any]] = {}
-        if items:
-            for item in items:
-                product = build_product(item)
-                if product.get("url"):
-                    products_map[product["url"]] = product
-
-        products: List[Dict[str, Any]] = []
-        for href in product_links:
-            if href in products_map:
-                products.append(products_map[href])
-            else:
-                products.append(
-                    {
-                        "name": None,
-                        "typeName": None,
-                        "price": None,
-                        "url": href,
-                        "image": None,
-                    }
-                )
+        page.wait_for_selector(
+            "div.plp-product-list__products > *", timeout=45000
+        )
+        products = collect_products_across_pages(page)
 
         print(
             "Total unique product urls = {count}".format(
-                count=len(product_links)
+                count=len(products)
             )
         )
 
