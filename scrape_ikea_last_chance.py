@@ -38,6 +38,7 @@ DEBUG_LINKS = "playwright_debug_links.txt"
 STORE_DEBUG_SCREENSHOT = "store_debug.png"
 STORE_DEBUG_HTML = "store_debug.html"
 STORE_DEBUG_TEXT = "store_debug.txt"
+STORE_HEADER_CONTROLS = "store_header_controls.txt"
 DEFAULT_HEADERS = {
     "User-Agent": DEFAULT_USER_AGENT,
     "Accept": "application/json",
@@ -161,6 +162,39 @@ def capture_store_debug(
         pass
 
 
+def capture_store_header_controls(page: Any) -> None:
+    controls: List[str] = []
+    try:
+        locator = page.locator("header button, header a")
+        for idx in range(locator.count()):
+            candidate = locator.nth(idx)
+            try:
+                text = extract_text(candidate) or ""
+                aria_label = candidate.get_attribute("aria-label") or ""
+                data_testid = candidate.get_attribute("data-testid") or ""
+                href = candidate.get_attribute("href") or ""
+                controls.append(
+                    " | ".join(
+                        [
+                            f"text={text}",
+                            f"aria-label={aria_label}",
+                            f"data-testid={data_testid}",
+                            f"href={href}",
+                        ]
+                    )
+                )
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        Path(STORE_HEADER_CONTROLS).write_text(
+            "\n".join(controls), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
 def open_store_modal(page: Any) -> None:
     selectors = [
         "button:has-text('Magasin')",
@@ -209,6 +243,9 @@ def open_store_modal(page: Any) -> None:
             return
 
     if not store_modal_is_open(page):
+        error = RuntimeError("Impossible d'ouvrir le modal Magasin/Store.")
+        capture_store_debug(page, error, None, None)
+        capture_store_header_controls(page)
         raise RuntimeError("Impossible d'ouvrir le modal Magasin/Store.")
 
 
