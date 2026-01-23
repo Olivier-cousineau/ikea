@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from threading import Event
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 
@@ -88,57 +88,51 @@ def find_show_more(page: Any) -> Optional[Any]:
 
 
 def count_products(page: Any) -> int:
-    primary_count = page.locator("div.plp-product-list_products > *").count()
+    primary_count = page.locator("div.plp-product-list__products > *").count()
     if primary_count:
         return primary_count
     return page.locator("a[href*='/p/']").count()
 
 
 def load_more_until_done(page: Any) -> None:
-    max_clicks = 50
-    clicks = 0
-    last_count = 0
-    while clicks < max_clicks:
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(1500)
+    max_pages = 50
+    pages = 0
+    while pages < max_pages:
+        current_count = count_products(page)
         more = page.locator('a[aria-label="Afficher plus de produits"]')
-        button = more.first if more.count() else find_show_more(page)
-        if not button:
+        link = more.first if more.count() else find_show_more(page)
+        if not link:
+            print("Load more: no link found.")
             break
         try:
-            if not button.is_visible():
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                page.wait_for_timeout(1000)
-            button.scroll_into_view_if_needed(timeout=2000)
-            current_count = count_products(page)
-            try:
-                button.click(timeout=8000)
-            except Exception:
-                page.evaluate("(el) => el.click()", button)
-            try:
-                page.wait_for_function(
-                    "(selector, before) => "
-                    "document.querySelectorAll(selector).length > before",
-                    ("a[href*='/p/']", current_count),
-                    timeout=10000,
-                )
-            except Exception:
-                pass
-            updated_count = count_products(page)
-            clicked_load_more = updated_count > current_count
-            print(
-                "Load more: before={before} after={after} clickedLoadMore={clicked}".format(
-                    before=current_count,
-                    after=updated_count,
-                    clicked=clicked_load_more,
-                )
-            )
-            if updated_count <= last_count and updated_count <= current_count:
-                break
-            last_count = updated_count
-            clicks += 1
+            href = link.get_attribute("href")
         except Exception:
+            href = None
+        if not href:
+            print("Load more: empty href.")
             break
+        next_url = urljoin(page.url, href)
+        print(
+            "Load more: [PAGE]={page} [NEXT]={next} [NAV]=goto".format(
+                page=page.url, next=next_url
+            )
+        )
+        if next_url == page.url:
+            break
+        page.goto(next_url, wait_until="domcontentloaded")
+        dismiss_consent(page)
+        try:
+            page.wait_for_selector("a[href*='/p/']", timeout=10000)
+        except Exception:
+            pass
+        updated_count = count_products(page)
+        print("Load more: before={before} after={after}".format(
+            before=current_count,
+            after=updated_count,
+        ))
+        if updated_count == 0:
+            break
+        pages += 1
 
 
 def capture_api_request(page_url: str, headed: bool) -> Tuple[str, Dict[str, str]]:
