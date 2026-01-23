@@ -112,3 +112,14 @@ jobs:
             public/ikea/*/data.json
             debug_ikea_last_chance.html
             debug_ikea_last_chance.png
+
+      - name: Upload store debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: store-debug-${{ matrix.store.slug }}
+          path: |
+            store_debug.png
+            store_debug.html
+            store_debug.txt
+          if-no-files-found: ignore
