@@ -7,6 +7,7 @@ import argparse
 import gzip
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -167,6 +168,57 @@ def pick_price(card: Any) -> Optional[str]:
     return None
 
 
+def normalize_store_label(label: str) -> str:
+    return " ".join(label.split())
+
+
+def parse_in_stock_label(label: str) -> Optional[str]:
+    match = re.search(r"En stock\s*:\s*(.+)", label, flags=re.IGNORECASE)
+    if not match:
+        return None
+    store = normalize_store_label(match.group(1))
+    return store or None
+
+
+def extract_in_stock_store(card: Any) -> Optional[str]:
+    locator = card.locator("text=/En stock\\s*:/")
+    if not locator.count():
+        return None
+    for idx in range(locator.count()):
+        text = extract_text(locator.nth(idx))
+        if not text:
+            continue
+        store = parse_in_stock_label(text)
+        if store:
+            return store
+    return None
+
+
+def extract_product_from_card(card: Any) -> Dict[str, Optional[str]]:
+    link_locator = card.locator("a[href*='/p/']").first
+    href = link_locator.get_attribute("href") if link_locator.count() else ""
+    if href and not href.startswith("http"):
+        href = f"https://www.ikea.com{href}"
+
+    image = None
+    img_locator = card.locator("img").first
+    if img_locator.count():
+        image = pick_image_source(img_locator)
+
+    name, type_name = pick_name_and_type(card)
+    price = pick_price(card)
+    in_stock_store = extract_in_stock_store(card)
+
+    return {
+        "name": name,
+        "typeName": type_name,
+        "price": price,
+        "url": href or None,
+        "image": image,
+        "inStockStore": in_stock_store,
+    }
+
+
 def collect_products_across_pages(page: Any) -> List[Dict[str, Any]]:
     max_pages = 50
     pages = 0
@@ -188,14 +240,10 @@ def collect_products_across_pages(page: Any) -> List[Dict[str, Any]]:
         card_count = cards.count()
         for idx in range(card_count):
             card = cards.nth(idx)
-            link_locator = card.locator("a[href*='/p/']").first
-            if not link_locator.count():
-                continue
-            href = link_locator.get_attribute("href") or ""
+            product_data = extract_product_from_card(card)
+            href = product_data.get("url") or ""
             if not href:
                 continue
-            if not href.startswith("http"):
-                href = f"https://www.ikea.com{href}"
             product = products_map.get(
                 href,
                 {
@@ -204,22 +252,12 @@ def collect_products_across_pages(page: Any) -> List[Dict[str, Any]]:
                     "price": None,
                     "url": href,
                     "image": None,
+                    "inStockStore": None,
                 },
             )
-            image = None
-            img_locator = card.locator("img").first
-            if img_locator.count():
-                image = pick_image_source(img_locator)
-            name, type_name = pick_name_and_type(card)
-            price = pick_price(card)
-            if image and not product.get("image"):
-                product["image"] = image
-            if name and not product.get("name"):
-                product["name"] = name
-            if type_name and not product.get("typeName"):
-                product["typeName"] = type_name
-            if price and not product.get("price"):
-                product["price"] = price
+            for key, value in product_data.items():
+                if value and not product.get(key):
+                    product[key] = value
             products_map[href] = product
 
         more = page.locator('a[aria-label="Afficher plus de produits"]')
@@ -527,6 +565,7 @@ def build_product(product: Dict[str, Any]) -> Dict[str, Any]:
         "price": extract_price(product),
         "url": link_url,
         "image": image,
+        "inStockStore": None,
     }
 
 
@@ -598,6 +637,29 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--store-param",
         default="storeId",
         help="Nom du paramètre de query pour le storeId.",
+    )
+    parser.add_argument(
+        "--expected-store-label",
+        help=(
+            "Libellé exact du magasin attendu dans les cartes "
+            "(ex: IKEA Montréal)."
+        ),
+    )
+    parser.add_argument(
+        "--store-display-name",
+        help="Nom d'affichage du magasin (ex: IKEA Montréal).",
+    )
+    parser.add_argument(
+        "--store-city",
+        help="Ville du magasin (ex: Montréal).",
+    )
+    parser.add_argument(
+        "--store-province",
+        help="Province du magasin (ex: QC).",
+    )
+    parser.add_argument(
+        "--store-slug",
+        help="Slug du magasin (ex: montreal-qc).",
     )
     return parser.parse_args(argv)
 
@@ -743,6 +805,60 @@ def scrape_url(url: str, headed: bool) -> List[Dict[str, Any]]:
     return products
 
 
+def is_store_output_path(path: Path) -> bool:
+    parts = path.parts
+    return (
+        len(parts) >= 4
+        and parts[-4] == "public"
+        and parts[-3] == "ikea"
+        and parts[-1] == "data.json"
+    )
+
+
+def build_store_payload(args: argparse.Namespace) -> Optional[Dict[str, str]]:
+    if not any(
+        [
+            args.store_display_name,
+            args.store_city,
+            args.store_province,
+            args.store_slug,
+        ]
+    ):
+        return None
+    return {
+        "displayName": args.store_display_name,
+        "city": args.store_city,
+        "province": args.store_province,
+        "slug": args.store_slug,
+    }
+
+
+def validate_store_sample(
+    products: List[Dict[str, Any]],
+    expected_store_label: str,
+    sample_size: int = 20,
+    min_matches: int = 5,
+) -> Dict[str, int]:
+    normalized_expected = normalize_store_label(expected_store_label)
+    sample = products[:sample_size]
+    matched = 0
+    for product in sample:
+        in_stock_store = product.get("inStockStore")
+        if (
+            in_stock_store
+            and normalize_store_label(in_stock_store) == normalized_expected
+        ):
+            matched += 1
+    result = {"checked": len(sample), "matched": matched}
+    if matched < min_matches:
+        raise RuntimeError(
+            "Validation du magasin échouée: "
+            f"{matched}/{len(sample)} cartes correspondent à "
+            f"{expected_store_label}."
+        )
+    return result
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     headed = should_use_headed(args.headed)
@@ -754,11 +870,30 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if not locations:
         products = scrape_url(args.url, headed)
+        expected_store = None
+        store_match_sample = None
+        if is_store_output_path(output_path):
+            if not args.expected_store_label:
+                raise RuntimeError(
+                    "expected-store-label requis pour valider "
+                    "les fichiers public/ikea/<store>/data.json."
+                )
+            expected_store = args.expected_store_label
+            store_match_sample = validate_store_sample(
+                products, expected_store
+            )
+        store_payload = build_store_payload(args)
         output = {
             "source": args.url,
             "count": len(products),
             "products": products,
         }
+        if store_payload:
+            output["store"] = store_payload
+        if expected_store:
+            output["expectedStore"] = expected_store
+        if store_match_sample:
+            output["storeMatchSample"] = store_match_sample
         with output_path.open("w", encoding="utf-8") as handle:
             json.dump(output, handle, ensure_ascii=False, indent=2)
         print(
