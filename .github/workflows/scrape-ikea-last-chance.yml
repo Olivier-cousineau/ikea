@@ -71,8 +71,6 @@ jobs:
 
       - name: Run scraper
         run: |
-          rm -rf "public/ikea"
-          mkdir -p "public/ikea"
           python scrape_ikea_last_chance.py \
             --expected-store-label "${{ matrix.store.label }}" \
             --store-slug "${{ matrix.store.slug }}" \
@@ -126,6 +124,28 @@ jobs:
             mkdir -p "$target_dir"
             cp "$data_file" "$target_dir/data.json"
           done
+
+      - name: Generate store index
+        run: |
+          cat <<'EOF' > econoplus/public/ikea/stores.json
+          [
+            "montreal-qc",
+            "boucherville-qc",
+            "ottawa-on",
+            "quebec-qc",
+            "north-york-on",
+            "toronto-downtown-on",
+            "vaughan-on",
+            "etobicoke-on",
+            "burlington-on",
+            "halifax-ns",
+            "winnipeg-mb",
+            "edmonton-ab",
+            "calgary-ab",
+            "coquitlam-bc",
+            "richmond-bc"
+          ]
+          EOF
 
       - name: Commit and push results to econoplus
         working-directory: econoplus
