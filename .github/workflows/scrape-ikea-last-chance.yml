@@ -162,3 +162,38 @@ jobs:
           fi
           git commit -m "Update IKEA last chance data"
           git push
+
+  upsert_to_supabase:
+    needs: publish_to_econoplus
+    if: always() && needs.publish_to_econoplus.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Download store artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: ikea-*
+          merge-multiple: true
+
+      - name: Install dependencies
+        run: npm install --omit=dev
+
+      - name: Upsert to Supabase
+        if: env.SUPABASE_URL != ''
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          if [ -n "$SUPABASE_URL" ] && [ -n "$SUPABASE_SERVICE_KEY" ]; then
+            node scripts/upsert_to_supabase.mjs ikea "artifacts/*/data.json"
+          else
+            echo "Supabase credentials not configured, skipping"
+          fi
