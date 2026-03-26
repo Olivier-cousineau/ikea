@@ -1,0 +1,9 @@
+{
+  "name": "ikea-scraper",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@supabase/supabase-js": "^2",
+    "glob": "^11"
+  }
+}
